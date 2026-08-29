@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from functools import partial
 from typing import Any
 
 import voluptuous as vol
@@ -21,9 +23,11 @@ from .const import (
     DOMAIN,
     MAX_SIGNAL_LIMIT,
     MIN_RECORDING_SECONDS,
+    SOLVE_CACHE_SECONDS,
     WS_ANCHOR_MAP,
     WS_LIST_ADAPTERS,
     WS_LIST_SIGNALS,
+    WS_RAW_OBSERVATIONS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +39,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_list_adapters)
     websocket_api.async_register_command(hass, ws_list_signals)
     websocket_api.async_register_command(hass, ws_anchor_map)
+    websocket_api.async_register_command(hass, ws_raw_observations)
 
 
 @websocket_api.require_admin
@@ -253,8 +258,8 @@ def _scanner_label(scanner: Any, device_reg: dr.DeviceRegistry) -> str:
 
 @websocket_api.require_admin
 @websocket_api.websocket_command({vol.Required("type"): WS_ANCHOR_MAP})
-@callback
-def ws_anchor_map(
+@websocket_api.async_response
+async def ws_anchor_map(
     hass: HomeAssistant,
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
@@ -314,15 +319,9 @@ def ws_anchor_map(
     if not ready:
         result = {"positions": {}, "pairs": [], "stress": None, "error": None}
     else:
-        observations = recorder.observations(ordered)
-        result = geometry.solve_layout(
-            ordered,
-            recorder.direct_links(ordered),
-            observations,
-            levels,
+        result = await _async_cached_solve(
+            hass, recorder, ordered, levels
         )
-        result["rejected_beacons"] = len(recorder.unstable(ordered))
-        result["tracked_beacons"] = len(recorder.stability(ordered))
 
     connection.send_result(
         msg["id"],
@@ -332,5 +331,107 @@ def ws_anchor_map(
             "ready": ready,
             "min_seconds": MIN_RECORDING_SECONDS,
             **result,
+        },
+    )
+
+
+async def _async_cached_solve(
+    hass: HomeAssistant,
+    recorder: Any,
+    ordered: list[str],
+    levels: dict[str, float],
+) -> dict[str, Any]:
+    """Solve the layout off the event loop, reusing a recent result.
+
+    The solve takes hundreds of milliseconds, which would stall Home Assistant
+    if run inline, and the geometry changes far more slowly than the panel polls.
+    """
+    cache = hass.data.setdefault(DOMAIN, {}).setdefault("solve_cache", {})
+    key = tuple(ordered)
+    now = time.monotonic()
+
+    cached = cache.get("result")
+    if (
+        cached is not None
+        and cache.get("key") == key
+        and now - cache.get("at", 0.0) < SOLVE_CACHE_SECONDS
+    ):
+        return cached
+
+    # Snapshot the recorder on the event loop, then do the arithmetic off it.
+    direct = recorder.direct_links(ordered)
+    observations = recorder.observations(ordered)
+    rejected = len(recorder.unstable(ordered))
+    tracked = len(recorder.stability(ordered))
+
+    result = await hass.async_add_executor_job(
+        partial(geometry.solve_layout, ordered, direct, observations, levels)
+    )
+    result["rejected_beacons"] = rejected
+    result["tracked_beacons"] = tracked
+
+    cache.update({"result": result, "key": key, "at": now})
+    return result
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): WS_RAW_OBSERVATIONS})
+@callback
+def ws_raw_observations(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Dump the recorder's raw view, so the solver can be worked on offline.
+
+    Tuning a solver by restarting Home Assistant between attempts is unusable.
+    This exposes exactly what solve_layout receives, so the same inputs can be
+    replayed against a candidate algorithm on a workstation.
+    """
+    recorder = hass.data.get(DOMAIN, {}).get("recorder")
+    if recorder is None:
+        connection.send_result(msg["id"], {"error": "recorder not running"})
+        return
+
+    device_reg = dr.async_get(hass)
+    area_reg = ar.async_get(hass)
+    floor_reg = fr.async_get(hass)
+
+    scanners = list(bluetooth.async_current_scanners(hass))
+    sources = [s for scanner in scanners if (s := getattr(scanner, "source", None))]
+
+    anchors = []
+    for scanner in scanners:
+        source = getattr(scanner, "source", None)
+        if not source:
+            continue
+        device = _find_device(device_reg, source)
+        area = area_reg.async_get_area(device.area_id) if device and device.area_id else None
+        floor = floor_reg.async_get_floor(area.floor_id) if area and area.floor_id else None
+        anchors.append(
+            {
+                "source": source,
+                "label": _scanner_label(scanner, device_reg),
+                "area": area.name if area else None,
+                "floor": floor.name if floor else None,
+                "level": float(floor.level) if floor and floor.level is not None else None,
+            }
+        )
+
+    connection.send_result(
+        msg["id"],
+        {
+            "anchors": anchors,
+            "elapsed": round(recorder.elapsed),
+            "observations": recorder.observations(sources),
+            "all_observations": recorder.observations(sources, stable_only=False),
+            "direct_links": [
+                {"listener": a, "advertiser": b, "rssi": v}
+                for (a, b), v in recorder.direct_links(sources).items()
+            ],
+            "stability": {
+                address: {"spread": round(spread, 2), "samples": samples}
+                for address, (spread, samples) in recorder.stability(sources).items()
+            },
         },
     )

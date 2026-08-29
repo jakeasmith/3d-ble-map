@@ -35,3 +35,10 @@ MIN_RECORDING_SECONDS = 30
 # near the radio noise floor, a moving one swings far wider.
 BEACON_MAX_SPREAD_DB = 6.0
 BEACON_MIN_SAMPLES = 4
+
+# The layout solve takes hundreds of milliseconds, which must not happen on the
+# event loop. It runs in an executor and the result is cached: the geometry
+# changes far more slowly than the panel polls.
+SOLVE_CACHE_SECONDS = 15
+
+WS_RAW_OBSERVATIONS = f"{DOMAIN}/raw_observations"

@@ -71,8 +71,35 @@ MAX_GAIN_DB = 12.0
 # Below this two points are indistinguishable and the spring direction is noise.
 MIN_SEPARATION_M = 0.3
 
+# Shadowing is Gaussian in dB, so inverting the path-loss law gives a *log*-normal
+# distance whose mean sits above the true distance by exp(a^2 sigma^2 / 2), where
+# a = ln10 / (10 n). At 2 dB that is under 2% and ignorable; at the 8 dB a real
+# house produces it is 30%, and it inflates the entire map. The estimate is
+# capped because the fit residual also carries model error, and over-correcting
+# would shrink the map instead.
+MAX_SHADOWING_DB = 12.0
+
 ROUNDS = 40
 SWEEPS_PER_ROUND = 8
+
+# SMACOF is a local method, so the answer depends on where it starts. The
+# convex-relaxation literature exists precisely because of this. Short of
+# solving an SDP, restarting from perturbed seeds and keeping the best fit
+# recovers most of the benefit: without it roughly one run in ten settles in a
+# badly wrong minimum, which is what produced 13m outliers against a 2m median.
+RESTARTS = 6
+RESTART_JITTER = 0.4
+
+
+def shadowing_bias(shadowing_db: float) -> float:
+    """How much the naive path-loss inversion overestimates distance.
+
+    Dividing an estimated distance by this returns the median of the log-normal
+    rather than its mean, which is the unbiased choice.
+    """
+    sigma = max(0.0, min(MAX_SHADOWING_DB, shadowing_db))
+    a = math.log(10) / (10 * PATH_LOSS_EXPONENT)
+    return math.exp((a * sigma) ** 2 / 2)
 
 
 def refine_layout(
@@ -81,6 +108,7 @@ def refine_layout(
     observations: dict[str, dict[str, float]],
     direct_rssi: dict[tuple[str, str], list[float]],
     levels: dict[str, float] | None = None,
+    shadowing_db: float = 0.0,
 ) -> dict[str, Any] | None:
     """Refine an initial layout, solving per-radio gain at the same time.
 
@@ -94,11 +122,10 @@ def refine_layout(
     if len(beacons) < len(radios):
         return None
 
-    points = [
+    seed_points = [
         [positions[radio]["x"], positions[radio]["y"], positions[radio]["z"]]
         for radio in radios
     ]
-    gains = [0.0] * len(radios)
 
     readings = [
         (index[radio], b, observations[radio][beacon])
@@ -114,28 +141,55 @@ def refine_layout(
     if not readings:
         return None
 
-    rng = random.Random(0)
-    beacon_points = [
-        _initial_beacon_position(radios, observations, beacon, points, rng)
-        for beacon in beacons
-    ]
-
     floor_groups = _floor_groups(radios, levels or {})
+    bias = shadowing_bias(shadowing_db)
+    scale = _scene_scale(seed_points)
 
-    before = _rms_residual(points, beacon_points, gains, readings, links)
-    current = before
+    before = _rms_residual(
+        seed_points,
+        [list(p) for p in seed_points[: len(beacons)]] or [[0.0, 0.0, 0.0]],
+        [0.0] * len(radios),
+        [],
+        links,
+    )
+    baseline = _rms_residual(
+        seed_points,
+        _seed_beacons(radios, observations, beacons, seed_points, random.Random(0)),
+        [0.0] * len(radios),
+        readings,
+        links,
+    )
 
-    for _ in range(ROUNDS):
-        gains = _solve_gains(
-            points, beacon_points, gains, readings, links, len(radios)
-        )
-        for _ in range(SWEEPS_PER_ROUND):
-            _majorize(
-                points, beacon_points, gains, readings, links, floor_groups
+    best: tuple[float, list[list[float]], list[float]] | None = None
+    for attempt in range(RESTARTS):
+        rng = random.Random(attempt)
+        points = [
+            point[:]
+            if attempt == 0
+            else [
+                value + rng.gauss(0, RESTART_JITTER * scale) for value in point
+            ]
+            for point in seed_points
+        ]
+        gains = [0.0] * len(radios)
+        beacon_points = _seed_beacons(radios, observations, beacons, points, rng)
+
+        for _ in range(ROUNDS):
+            gains = _solve_gains(
+                points, beacon_points, gains, readings, links, len(radios)
             )
-        current = _rms_residual(points, beacon_points, gains, readings, links)
+            for _ in range(SWEEPS_PER_ROUND):
+                _majorize(
+                    points, beacon_points, gains, readings, links, floor_groups, bias
+                )
 
-    if current >= before:
+        residual = _rms_residual(points, beacon_points, gains, readings, links)
+        if best is None or residual < best[0]:
+            best = (residual, [p[:] for p in points], gains[:])
+
+    current, points, gains = best
+
+    if current >= baseline:
         # Refinement is an optimisation, not an article of faith. If it did not
         # beat the seed layout, say so and let the caller keep the seed.
         return None
@@ -144,10 +198,35 @@ def refine_layout(
         "positions": [list(point) for point in points],
         "gains": {radio: round(gains[i], 1) for i, radio in enumerate(radios)},
         "residual_db": round(current, 2),
-        "seed_residual_db": round(before, 2),
+        "seed_residual_db": round(baseline, 2),
         "beacons_used": len(beacons),
         "observations": len(readings) + len(links),
+        "shadowing_db": round(shadowing_db, 2),
+        "bias_correction": round(bias, 3),
+        "restarts": RESTARTS,
     }
+
+
+def _seed_beacons(
+    radios: Sequence[str],
+    observations: dict[str, dict[str, float]],
+    beacons: Sequence[str],
+    points: list[list[float]],
+    rng: random.Random,
+) -> list[list[float]]:
+    return [
+        _initial_beacon_position(radios, observations, beacon, points, rng)
+        for beacon in beacons
+    ]
+
+
+def _scene_scale(points: list[list[float]]) -> float:
+    """Rough extent of the seed layout, so jitter is proportional to the house."""
+    spans = [
+        max(p[axis] for p in points) - min(p[axis] for p in points)
+        for axis in range(3)
+    ]
+    return max(1.0, max(spans))
 
 
 def _floor_groups(
@@ -168,6 +247,7 @@ def _majorize(
     readings: list[tuple[int, int, float]],
     links: list[tuple[int, int, float]],
     floor_groups: list[list[int]],
+    bias: float,
 ) -> None:
     """One SMACOF sweep: move every point to where its springs want it.
 
@@ -182,7 +262,7 @@ def _majorize(
     beacon_weights = [0.0] * len(beacon_points)
 
     for radio, beacon, observed in readings:
-        rest = _rest_length(observed - gains[radio])
+        rest = _rest_length(observed - gains[radio], bias)
         if rest is None:
             continue
         _pull(points[radio], beacon_points[beacon], rest, targets[radio], weights, radio)
@@ -196,7 +276,7 @@ def _majorize(
         )
 
     for listener, advertiser, observed in links:
-        rest = _rest_length(observed - gains[listener] - gains[advertiser])
+        rest = _rest_length(observed - gains[listener] - gains[advertiser], bias)
         if rest is None:
             continue
         _pull(points[listener], points[advertiser], rest, targets[listener], weights, listener)
@@ -245,14 +325,26 @@ def _pull(
     )
     weight = 1.0 if residual_db <= HUBER_DELTA_DB else HUBER_DELTA_DB / residual_db
 
+    # Shadowing is Gaussian in dB, not in metres, so a fixed dB error is a
+    # *proportional* distance error. Weighting by 1/d^2 makes minimising this sum
+    # equivalent to minimising squared dB error, the maximum likelihood
+    # objective. Without it a distant, weak link outweighs a close reliable one
+    # simply for being further away.
+    #
+    # The weight must use the *model* distance, not the measured rest length.
+    # Weighting by the measurement lets any link that noise happens to make look
+    # short dominate everything, and the whole map collapses inward -- measured
+    # at 0.57x true scale before this was corrected.
+    weight /= distance * distance
+
     for axis in range(3):
         target[axis] += weight * (neighbour[axis] + rest * delta[axis] / distance)
     weights[index] += weight
 
 
-def _rest_length(rssi: float) -> float | None:
+def _rest_length(rssi: float, bias: float = 1.0) -> float | None:
     """Spring rest length: the distance this reading implies, or None if absurd."""
-    distance = 10 ** ((TX_POWER_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT))
+    distance = 10 ** ((TX_POWER_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT)) / bias
     if MIN_DISTANCE_M <= distance <= MAX_DISTANCE_M:
         return distance
     return None

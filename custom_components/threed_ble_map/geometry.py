@@ -91,8 +91,22 @@ def solve_layout(
         anchor: {"x": p[0], "y": p[1], "z": p[2]}
         for anchor, p in zip(anchors, coords)
     }
+    # Two passes. The first measures how much shadowing there is; the second
+    # uses that to undo the log-normal bias, which at a real house's noise level
+    # inflates every distance by about 30%. Estimating it from the fit is the
+    # only option -- nothing else in the system knows the shadowing figure.
     refined = refine_layout(anchors, seed, observations, direct_rssi, levels)
     if refined is not None:
+        corrected = refine_layout(
+            anchors,
+            seed,
+            observations,
+            direct_rssi,
+            levels,
+            shadowing_db=refined["residual_db"],
+        )
+        if corrected is not None:
+            refined = corrected
         coords = refined["positions"]
 
     coords = _orient_by_level(anchors, coords, levels or {})
@@ -107,6 +121,8 @@ def solve_layout(
         "gains": refined["gains"] if refined else {},
         "residual_db": refined["residual_db"] if refined else None,
         "beacons_used": refined["beacons_used"] if refined else 0,
+        "shadowing_db": refined["shadowing_db"] if refined else None,
+        "bias_correction": refined["bias_correction"] if refined else None,
         "refined": refined is not None,
         "error": None,
     }
@@ -121,6 +137,8 @@ def _empty(error: str, pairs: list[dict[str, Any]] | None = None) -> dict[str, A
         "gains": {},
         "residual_db": None,
         "beacons_used": 0,
+        "shadowing_db": None,
+        "bias_correction": None,
         "refined": False,
         "error": error,
     }
