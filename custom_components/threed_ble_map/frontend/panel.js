@@ -323,9 +323,10 @@ class ThreeDBleMapPanel extends HTMLElement {
 
 const MAP_BLURB =
   "A rough relative layout, solved from how loudly each radio hears the others " +
-  "and the beacons they share. Distances come from a log-distance path-loss " +
-  "model, so treat this as metres-accurate at best. Position is relative: the " +
-  "shape is meaningful, the origin is not.";
+  "and the beacons they share. Position is relative: the shape is meaningful, " +
+  "the origin is not. Note that the vertical axis is stretched — a floor " +
+  "between two radios eats signal that the path-loss model reads as distance, " +
+  "so storeys come out further apart than they are.";
 
 const STYLES = `
   :host {

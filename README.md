@@ -81,6 +81,19 @@ Solid lines are direct radio-to-radio links; dashed lines are inferred. **Fit
 error** is Kruskal stress — the mismatch between the estimated distances and the
 layout drawn. Under ~10% is a usable shape.
 
+**Known limitation: the vertical axis is stretched.** A floor between two
+radios costs signal that the path-loss model books as distance, so cross-floor
+pairs read further apart than they are. On the two-storey house this was built
+against, storeys about 3 m apart come out roughly 10-13 m apart. The floors
+separate in the right order and same-floor distances are plausible, but do not
+read the vertical scale as metres.
+
+This is not fixable from signal alone. Fitting a single cross-floor penalty by
+minimising stress was tried and does not work: with five anchors, 3D MDS has
+enough freedom to fit the inflated distances just as well, so stress is
+insensitive to the penalty and the fit returns zero. Correcting it needs ground
+truth — a few anchor positions entered by hand — which is the next milestone.
+
 **What this is not.** RSSI-derived distance is metres-accurate at best, and
 walls, floors and furniture all bias it. The origin and the absolute orientation
 around the vertical axis are arbitrary: the *shape* is the output, not the
