@@ -42,11 +42,14 @@ from .geometry import (
 )
 
 # A beacon costs three unknowns -- its own position -- and supplies one
-# observation per radio that hears it. So a beacon heard by exactly three radios
-# nets out at zero: it pins itself and constrains nothing. Four is the first
-# count that actually helps place a radio, and excluding the rest removes noise
-# without losing information.
-MIN_RADIOS_PER_BEACON = 4
+# observation per radio that hears it, so at exactly three it nets out to zero
+# constraint on the radios: it only pins itself.
+#
+# That argument says such beacons are neutral, not harmful, and raising this to
+# 4 was tried and reverted: on a five-radio house it halved the usable beacons
+# (60 to 32) and the layout got noisier, not cleaner. Neutral data is worth
+# keeping when the alternative is half as much of it.
+MIN_RADIOS_PER_BEACON = 3
 
 # Radios on one storey share a floor, so their heights should agree. Home
 # Assistant knows which floor each radio is on, and that is a much stronger fact
