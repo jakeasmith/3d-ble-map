@@ -250,7 +250,8 @@ class ThreeDBleMapPanel extends HTMLElement {
         <div class="stats" id="stats"></div>
         <div class="card canvas-card"><canvas id="scene"></canvas></div>
         <div class="hint">Drag to orbit · scroll to zoom · solid lines are direct
-          radio-to-radio links, dashed lines are inferred from shared beacons.</div>
+          radio-to-radio links, dashed lines are inferred from shared beacons.
+          Each plane sits at the mean height of the radios on that floor.</div>
         <h2>Radios</h2>
         <div class="sub">Gain is how far each radio reads from the group average,
           solved from the data rather than assumed. A radio reading hot would
@@ -291,7 +292,7 @@ class ThreeDBleMapPanel extends HTMLElement {
       .map((anchor) => ({
         id: anchor.source,
         label: anchor.label,
-        sublabel: anchor.floor || anchor.area || "",
+        floor: anchor.floor,
         color: colors.get(anchor.floor) || UNKNOWN_FLOOR_COLOR,
         ...map.positions[anchor.source],
       }));
