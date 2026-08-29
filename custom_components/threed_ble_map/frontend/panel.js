@@ -1,9 +1,17 @@
 // The module URL carries a cache-busting token; pass it on so an edit to an
-// imported module is picked up too.
+// imported module is picked up too. The renderer is imported lazily rather than
+// with a top-level await: awaiting here would delay customElements.define past
+// the point Home Assistant creates the element, and an element created before
+// its definition keeps `hass` as an own property that shadows the setter below.
 const VERSION = new URL(import.meta.url).searchParams.get("v") || "";
-const { AnchorScene } = await import(
-  `./map3d.js${VERSION ? `?v=${VERSION}` : ""}`
-);
+let scenePromise = null;
+
+function loadScene() {
+  if (!scenePromise) {
+    scenePromise = import(`./map3d.js${VERSION ? `?v=${VERSION}` : ""}`);
+  }
+  return scenePromise;
+}
 
 const REFRESH_MS = 5000;
 const SIGNAL_LIMIT = 20;
@@ -24,6 +32,7 @@ class ThreeDBleMapPanel extends HTMLElement {
     this._error = null;
     this._timer = null;
     this._scene = null;
+    this._sceneLoading = false;
     this._rendered = false;
   }
 
@@ -38,12 +47,24 @@ class ThreeDBleMapPanel extends HTMLElement {
   }
 
   connectedCallback() {
+    // If this element was created before its definition loaded, `hass` is an
+    // own property sitting in front of the setter. Re-assign it so the setter
+    // actually runs; without this the panel never receives any data.
+    this._upgradeProperty("hass");
     this._renderShell();
     this._timer = setInterval(() => this._refresh(), REFRESH_MS);
     this._onResize = () => this._scene && this._scene.resize();
     window.addEventListener("resize", this._onResize);
     this._onPopState = () => this._setView(pathToView(location.pathname), false);
     window.addEventListener("popstate", this._onPopState);
+  }
+
+  _upgradeProperty(name) {
+    if (Object.prototype.hasOwnProperty.call(this, name)) {
+      const value = this[name];
+      delete this[name];
+      this[name] = value;
+    }
   }
 
   disconnectedCallback() {
@@ -86,6 +107,7 @@ class ThreeDBleMapPanel extends HTMLElement {
       );
     }
     this._scene = null;
+    this._sceneLoading = false;
     this._renderView();
     this._refresh();
   }
@@ -222,7 +244,7 @@ class ThreeDBleMapPanel extends HTMLElement {
 
     const colors = floorColors(map.anchors);
 
-    if (!this._scene) {
+    if (!this._scene && !this._sceneLoading) {
       container.innerHTML = `
         <div class="sub">${MAP_BLURB}</div>
         <div class="stats" id="stats"></div>
@@ -236,11 +258,20 @@ class ThreeDBleMapPanel extends HTMLElement {
         <div class="card" id="radios"></div>
         <h2>Pair distances</h2>
         <div class="card" id="pairs"></div>`;
-      this._scene = new AnchorScene(this.shadowRoot.getElementById("scene"));
-      requestAnimationFrame(() => this._scene && this._scene.resize());
+      this._sceneLoading = true;
+      loadScene().then(({ AnchorScene }) => {
+        this._sceneLoading = false;
+        const canvas = this.shadowRoot.getElementById("scene");
+        if (!canvas) return;
+        this._scene = new AnchorScene(canvas);
+        this._scene.resize();
+        this._renderView();
+      });
     }
 
-    this.shadowRoot.getElementById("stats").innerHTML = this._mapStats(map);
+    const stats = this.shadowRoot.getElementById("stats");
+    if (!stats) return;
+    stats.innerHTML = this._mapStats(map);
     this.shadowRoot.getElementById("radios").innerHTML = this._radioTable(
       map,
       colors,
@@ -250,8 +281,8 @@ class ThreeDBleMapPanel extends HTMLElement {
       colors,
     );
 
-    if (map.error) {
-      this._scene.setData([], []);
+    if (map.error || !this._scene) {
+      if (this._scene) this._scene.setData([], []);
       return;
     }
 
