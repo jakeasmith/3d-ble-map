@@ -4,6 +4,12 @@
 
 const NODE_RADIUS = 7;
 const GRID_DIVISIONS = 6;
+const ANIMATION_MS = 700;
+
+// The floor plane is drawn under the lowest radio on its storey, clear of it by
+// this fraction of the scene's height so the radio never sits inside the plane.
+const FLOOR_CLEARANCE = 0.06;
+const MIN_FLOOR_CLEARANCE_M = 0.3;
 
 export class AnchorScene {
   constructor(canvas) {
@@ -15,13 +21,96 @@ export class AnchorScene {
     this.elevation = 0.45;
     this.zoom = 1;
     this.hovered = null;
+    this.showEdges = true;
+    this._frame = null;
     this._bindPointer();
   }
 
   setData(nodes, edges) {
-    this.nodes = nodes;
     this.edges = edges;
+    const aligned = this._align(nodes);
+    if (!this.nodes.length) {
+      this.nodes = aligned;
+      this.draw();
+      return;
+    }
+    this._animateTo(aligned);
+  }
+
+  setShowEdges(value) {
+    this.showEdges = value;
     this.draw();
+  }
+
+  // Rotate a new solution onto the previous one. The solver has no preferred
+  // rotation about the vertical axis, nor a preferred handedness, so
+  // consecutive solves come back arbitrarily spun and the view appears to jump.
+  // Applying the rotation and reflection that best match the previous positions
+  // is a change of viewpoint only: it leaves every distance untouched.
+  _align(nodes) {
+    const previous = new Map(this.nodes.map((node) => [node.id, node]));
+    const pairs = nodes
+      .filter((node) => previous.has(node.id))
+      .map((node) => [node, previous.get(node.id)]);
+    if (pairs.length < 2) return nodes;
+
+    let best = null;
+    for (const mirror of [1, -1]) {
+      // Closed-form best rotation about z for a set of point pairs.
+      let cross = 0;
+      let dot = 0;
+      for (const [next, prior] of pairs) {
+        const x = mirror * next.x;
+        cross += x * prior.y - next.y * prior.x;
+        dot += x * prior.x + next.y * prior.y;
+      }
+      const angle = Math.atan2(cross, dot);
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+
+      let error = 0;
+      for (const [next, prior] of pairs) {
+        const x = mirror * next.x;
+        error +=
+          (x * cos - next.y * sin - prior.x) ** 2 +
+          (x * sin + next.y * cos - prior.y) ** 2 +
+          (next.z - prior.z) ** 2;
+      }
+      if (!best || error < best.error) best = {error, angle, mirror};
+    }
+
+    const cos = Math.cos(best.angle);
+    const sin = Math.sin(best.angle);
+    return nodes.map((node) => {
+      const x = best.mirror * node.x;
+      return {...node, x: x * cos - node.y * sin, y: x * sin + node.y * cos};
+    });
+  }
+
+  _animateTo(target) {
+    const from = new Map(
+      this.nodes.map((node) => [node.id, {x: node.x, y: node.y, z: node.z}]),
+    );
+    const started = performance.now();
+    cancelAnimationFrame(this._frame);
+
+    const tick = (now) => {
+      const t = Math.min(1, (now - started) / ANIMATION_MS);
+      const eased = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+      this.nodes = target.map((node) => {
+        const start = from.get(node.id);
+        if (!start) return node;
+        return {
+          ...node,
+          x: start.x + (node.x - start.x) * eased,
+          y: start.y + (node.y - start.y) * eased,
+          z: start.z + (node.z - start.z) * eased,
+        };
+      });
+      this.draw();
+      if (t < 1) this._frame = requestAnimationFrame(tick);
+    };
+    this._frame = requestAnimationFrame(tick);
   }
 
   _bindPointer() {
@@ -161,11 +250,11 @@ export class AnchorScene {
     this._drawStems(ctx, camera, projected, mutedColor);
 
     // Painter's algorithm: far edges and nodes first.
-    for (const edge of [...this.edges].sort(
+    for (const edge of this.showEdges ? [...this.edges].sort(
       (a, b) =>
         (byId.get(a.a)?.depth ?? 0) + (byId.get(a.b)?.depth ?? 0) -
         ((byId.get(b.a)?.depth ?? 0) + (byId.get(b.b)?.depth ?? 0)),
-    )) {
+    ) : []) {
       const from = byId.get(edge.a);
       const to = byId.get(edge.b);
       if (!from || !to) continue;
@@ -206,20 +295,28 @@ export class AnchorScene {
   }
 
   _floors() {
-    // One plane per building floor, sitting at the mean height of the radios on
-    // it. The solver places radios, not storeys, so this is the best available
-    // reading of where a floor is.
+    // One plane per building floor, sitting just below the lowest radio on that
+    // storey. A radio stands on its floor, so the plane has to clear all of
+    // them -- placing it at the mean would leave half the radios underneath.
     const groups = new Map();
     for (const node of this.nodes) {
       if (!node.floor) continue;
       if (!groups.has(node.floor)) groups.set(node.floor, []);
       groups.get(node.floor).push(node);
     }
+    if (!groups.size) return [];
+
+    const zs = this.nodes.map((node) => node.z);
+    const clearance = Math.max(
+      MIN_FLOOR_CLEARANCE_M,
+      (Math.max(...zs) - Math.min(...zs)) * FLOOR_CLEARANCE,
+    );
+
     return [...groups.entries()]
       .map(([name, nodes]) => ({
         name,
         color: nodes[0].color,
-        z: nodes.reduce((sum, n) => sum + n.z, 0) / nodes.length,
+        z: Math.min(...nodes.map((node) => node.z)) - clearance,
       }))
       .sort((a, b) => a.z - b.z);
   }

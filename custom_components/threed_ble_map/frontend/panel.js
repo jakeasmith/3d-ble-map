@@ -33,6 +33,7 @@ class ThreeDBleMapPanel extends HTMLElement {
     this._timer = null;
     this._scene = null;
     this._sceneLoading = false;
+    this._showEdges = true;
     this._rendered = false;
   }
 
@@ -249,9 +250,12 @@ class ThreeDBleMapPanel extends HTMLElement {
         <div class="sub">${MAP_BLURB}</div>
         <div class="stats" id="stats"></div>
         <div class="card canvas-card"><canvas id="scene"></canvas></div>
+        <div class="controls">
+          <label><input type="checkbox" id="show-edges" /> Show links between radios</label>
+        </div>
         <div class="hint">Drag to orbit · scroll to zoom · solid lines are direct
           radio-to-radio links, dashed lines are inferred from shared beacons.
-          Each plane sits at the mean height of the radios on that floor.</div>
+          Each plane sits just below the radios on that floor.</div>
         <h2>Radios</h2>
         <div class="sub">Gain is how far each radio reads from the group average,
           solved from the data rather than assumed. A radio reading hot would
@@ -259,12 +263,20 @@ class ThreeDBleMapPanel extends HTMLElement {
         <div class="card" id="radios"></div>
         <h2>Pair distances</h2>
         <div class="card" id="pairs"></div>`;
+      const toggle = this.shadowRoot.getElementById("show-edges");
+      toggle.checked = this._showEdges;
+      toggle.addEventListener("change", () => {
+        this._showEdges = toggle.checked;
+        if (this._scene) this._scene.setShowEdges(this._showEdges);
+      });
+
       this._sceneLoading = true;
       loadScene().then(({ AnchorScene }) => {
         this._sceneLoading = false;
         const canvas = this.shadowRoot.getElementById("scene");
         if (!canvas) return;
         this._scene = new AnchorScene(canvas);
+        this._scene.setShowEdges(this._showEdges);
         this._scene.resize();
         this._renderView();
       });
@@ -446,6 +458,9 @@ const STYLES = `
   .heard { color: var(--secondary-text-color); font-size: 13px; white-space: normal; }
   .msg { padding: 24px; color: var(--secondary-text-color); }
   .msg.err { color: var(--error-color, #f44336); }
+  .controls { display: flex; gap: 20px; margin-top: 12px; font-size: 14px; }
+  .controls label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .controls input { accent-color: var(--primary-color, #03a9f4); cursor: pointer; }
   .stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
   .stat {
     background: var(--card-background-color);

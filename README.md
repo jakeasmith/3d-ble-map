@@ -150,3 +150,30 @@ Run the checks with `python3 tests/test_geometry.py`.
 ## Licence
 
 MIT
+
+## Developing against a live Home Assistant
+
+Frontend and backend iterate very differently, and knowing which is which saves
+a lot of waiting.
+
+**Frontend (`frontend/*.js`) needs no restart.** The files are read from disk per
+request and served with `cache_headers=False`, so a real browser reload picks up
+a change. Note that clicking through Home Assistant's sidebar is client-side
+routing and does *not* re-fetch modules — press F5 (or Ctrl/Cmd-Shift-R) to force
+an actual document load.
+
+**Backend (`*.py`) needs a restart.** Python caches modules in `sys.modules`, and
+reloading the config entry re-runs setup without re-importing. There is no
+official hot-reload for custom integrations.
+
+To make deploys a single command, clone the repo somewhere persistent on the HA
+host and symlink it into place, so `git pull` *is* the deploy:
+
+```bash
+git clone https://github.com/jakeasmith/3d-ble-map /config/3d-ble-map
+ln -s /config/3d-ble-map/custom_components/threed_ble_map \
+      /config/custom_components/threed_ble_map
+```
+
+Then from the Terminal add-on: `git -C /config/3d-ble-map pull`, and reload the
+browser. Restart Home Assistant only when Python changed.
