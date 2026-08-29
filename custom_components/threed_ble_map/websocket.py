@@ -9,11 +9,19 @@ import voluptuous as vol
 
 from homeassistant.components import bluetooth, websocket_api
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import area_registry as ar, device_registry as dr
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    floor_registry as fr,
+)
 
+from . import geometry
 from .const import (
     DEFAULT_SIGNAL_LIMIT,
+    DOMAIN,
     MAX_SIGNAL_LIMIT,
+    MIN_RECORDING_SECONDS,
+    WS_ANCHOR_MAP,
     WS_LIST_ADAPTERS,
     WS_LIST_SIGNALS,
 )
@@ -26,6 +34,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register this integration's websocket commands."""
     websocket_api.async_register_command(hass, ws_list_adapters)
     websocket_api.async_register_command(hass, ws_list_signals)
+    websocket_api.async_register_command(hass, ws_anchor_map)
 
 
 @websocket_api.require_admin
@@ -240,3 +249,85 @@ def _scanner_label(scanner: Any, device_reg: dr.DeviceRegistry) -> str:
     if device := _find_device(device_reg, source):
         return device.name_by_user or device.name or source
     return getattr(scanner, "adapter", None) or source
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): WS_ANCHOR_MAP})
+@callback
+def ws_anchor_map(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Estimate where each anchor sits in 3D, relative to the others."""
+    recorder = hass.data.get(DOMAIN, {}).get("recorder")
+    if recorder is None:
+        connection.send_result(
+            msg["id"],
+            {
+                "anchors": [],
+                "positions": {},
+                "pairs": [],
+                "stress": None,
+                "elapsed": 0,
+                "ready": False,
+                "error": "The signal recorder is not running.",
+            },
+        )
+        return
+
+    device_reg = dr.async_get(hass)
+    area_reg = ar.async_get(hass)
+    floor_reg = fr.async_get(hass)
+
+    scanners = list(bluetooth.async_current_scanners(hass))
+    sources = [s for scanner in scanners if (s := getattr(scanner, "source", None))]
+
+    anchors = []
+    levels: dict[str, float] = {}
+    counts = recorder.sample_counts(sources)
+    for scanner in scanners:
+        source = getattr(scanner, "source", None)
+        if not source:
+            continue
+        device = _find_device(device_reg, source)
+        area = area_reg.async_get_area(device.area_id) if device and device.area_id else None
+        floor = floor_reg.async_get_floor(area.floor_id) if area and area.floor_id else None
+        if floor is not None and floor.level is not None:
+            levels[source] = float(floor.level)
+        anchors.append(
+            {
+                "source": source,
+                "label": _scanner_label(scanner, device_reg),
+                "area": area.name if area else None,
+                "floor": floor.name if floor else None,
+                "level": levels.get(source),
+                "tracked_beacons": counts.get(source, 0),
+            }
+        )
+    anchors.sort(key=lambda anchor: anchor["label"])
+
+    ordered = [anchor["source"] for anchor in anchors]
+    elapsed = round(recorder.elapsed)
+    ready = elapsed >= MIN_RECORDING_SECONDS
+
+    if not ready:
+        result = {"positions": {}, "pairs": [], "stress": None, "error": None}
+    else:
+        result = geometry.solve_layout(
+            ordered,
+            recorder.direct_links(ordered),
+            recorder.observations(ordered),
+            levels,
+        )
+
+    connection.send_result(
+        msg["id"],
+        {
+            "anchors": anchors,
+            "elapsed": elapsed,
+            "ready": ready,
+            "min_seconds": MIN_RECORDING_SECONDS,
+            **result,
+        },
+    )
