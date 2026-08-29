@@ -90,6 +90,22 @@ SWEEPS_PER_ROUND = 8
 RESTARTS = 6
 RESTART_JITTER = 0.4
 
+# A floor between transmitter and receiver costs signal that the path-loss model
+# would otherwise book as distance, pushing storeys apart. Measured on a real
+# two-storey house, ignoring it left cross-floor pairs +3.0 m too far apart while
+# same-floor pairs were unbiased.
+#
+# This is a fixed prior, NOT fitted, and that is deliberate. The penalty and the
+# vertical separation are degenerate: raising the penalty while collapsing the
+# storey gap produces an identical fit, so a free fit always over-attributes to
+# attenuation. Left uncapped it settles at 8 dB and over-corrects the layout to
+# 0.83x true scale.
+#
+# CAVEAT: 3 dB is validated against exactly one house. It is a hypothesis about
+# building construction, not a measured universal, and wants checking somewhere
+# with a different floor assembly.
+FLOOR_PENALTY_DB = 3.0
+
 
 def shadowing_bias(shadowing_db: float) -> float:
     """How much the naive path-loss inversion overestimates distance.
@@ -141,7 +157,9 @@ def refine_layout(
     if not readings:
         return None
 
-    floor_groups = _floor_groups(radios, levels or {})
+    levels = levels or {}
+    floor_groups = _floor_groups(radios, levels)
+    radio_levels = [levels.get(radio) for radio in radios]
     bias = shadowing_bias(shadowing_db)
     scale = _scene_scale(seed_points)
 
@@ -173,21 +191,28 @@ def refine_layout(
         ]
         gains = [0.0] * len(radios)
         beacon_points = _seed_beacons(radios, observations, beacons, points, rng)
+        penalty = FLOOR_PENALTY_DB if any(
+            level is not None for level in radio_levels
+        ) else 0.0
 
         for _ in range(ROUNDS):
             gains = _solve_gains(
-                points, beacon_points, gains, readings, links, len(radios)
+                points, beacon_points, gains, readings, links,
+                len(radios), radio_levels, penalty,
             )
             for _ in range(SWEEPS_PER_ROUND):
                 _majorize(
-                    points, beacon_points, gains, readings, links, floor_groups, bias
+                    points, beacon_points, gains, readings, links,
+                    floor_groups, bias, radio_levels, penalty,
                 )
 
-        residual = _rms_residual(points, beacon_points, gains, readings, links)
+        residual = _rms_residual(
+            points, beacon_points, gains, readings, links, radio_levels, penalty
+        )
         if best is None or residual < best[0]:
-            best = (residual, [p[:] for p in points], gains[:])
+            best = (residual, [p[:] for p in points], gains[:], penalty)
 
-    current, points, gains = best
+    current, points, gains, penalty = best
 
     if current >= baseline:
         # Refinement is an optimisation, not an article of faith. If it did not
@@ -203,8 +228,39 @@ def refine_layout(
         "observations": len(readings) + len(links),
         "shadowing_db": round(shadowing_db, 2),
         "bias_correction": round(bias, 3),
+        "floor_penalty_db": round(penalty, 1),
         "restarts": RESTARTS,
     }
+
+
+def _floors_apart(
+    radio_level: float | None, other_level: float | None
+) -> float:
+    """Storeys between two endpoints, or 0 when either storey is unknown."""
+    if radio_level is None or other_level is None:
+        return 0.0
+    return abs(radio_level - other_level)
+
+
+def _beacon_levels(
+    beacon_points: list[list[float]],
+    points: list[list[float]],
+    radio_levels: list[float | None],
+) -> list[float | None]:
+    """Assign each beacon the storey of whichever radio floor it sits nearest."""
+    heights: dict[float, list[float]] = {}
+    for point, level in zip(points, radio_levels):
+        if level is not None:
+            heights.setdefault(level, []).append(point[2])
+    if len(heights) < 2:
+        return [None] * len(beacon_points)
+    means = {level: sum(v) / len(v) for level, v in heights.items()}
+    return [
+        min(means, key=lambda level: abs(means[level] - beacon[2]))
+        for beacon in beacon_points
+    ]
+
+
 
 
 def _seed_beacons(
@@ -248,6 +304,8 @@ def _majorize(
     links: list[tuple[int, int, float]],
     floor_groups: list[list[int]],
     bias: float,
+    radio_levels: list[float | None] | None = None,
+    floor_penalty: float = 0.0,
 ) -> None:
     """One SMACOF sweep: move every point to where its springs want it.
 
@@ -261,8 +319,17 @@ def _majorize(
     beacon_targets = [[0.0] * 3 for _ in beacon_points]
     beacon_weights = [0.0] * len(beacon_points)
 
+    levels = radio_levels or [None] * len(points)
+    beacon_levels = (
+        _beacon_levels(beacon_points, points, levels)
+        if floor_penalty
+        else [None] * len(beacon_points)
+    )
+
     for radio, beacon, observed in readings:
-        rest = _rest_length(observed - gains[radio], bias)
+        # Add the floor loss back before inverting: it is attenuation, not range.
+        crossed = floor_penalty * _floors_apart(levels[radio], beacon_levels[beacon])
+        rest = _rest_length(observed - gains[radio] + crossed, bias)
         if rest is None:
             continue
         _pull(points[radio], beacon_points[beacon], rest, targets[radio], weights, radio)
@@ -276,7 +343,12 @@ def _majorize(
         )
 
     for listener, advertiser, observed in links:
-        rest = _rest_length(observed - gains[listener] - gains[advertiser], bias)
+        crossed = floor_penalty * _floors_apart(
+            levels[listener], levels[advertiser]
+        )
+        rest = _rest_length(
+            observed - gains[listener] - gains[advertiser] + crossed, bias
+        )
         if rest is None:
             continue
         _pull(points[listener], points[advertiser], rest, targets[listener], weights, listener)
@@ -357,6 +429,8 @@ def _solve_gains(
     readings: list[tuple[int, int, float]],
     links: list[tuple[int, int, float]],
     radio_count: int,
+    radio_levels: list[float | None] | None = None,
+    floor_penalty: float = 0.0,
 ) -> list[float]:
     """Closed-form gain update: each radio's median residual against the model.
 
@@ -365,19 +439,33 @@ def _solve_gains(
     wall-blocked beacon from dragging a radio's whole calibration.
     """
     per_radio: list[list[float]] = [[] for _ in range(radio_count)]
+    levels = radio_levels or [None] * radio_count
+    beacon_levels = (
+        _beacon_levels(beacon_points, points, levels)
+        if floor_penalty
+        else [None] * len(beacon_points)
+    )
 
     for radio, beacon, observed in readings:
         distance = max(
             MIN_SEPARATION_M, math.dist(points[radio], beacon_points[beacon])
         )
-        predicted = TX_POWER_AT_1M - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+        predicted = (
+            TX_POWER_AT_1M
+            - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+            - floor_penalty * _floors_apart(levels[radio], beacon_levels[beacon])
+        )
         per_radio[radio].append(observed - predicted)
 
     for listener, advertiser, observed in links:
         distance = max(
             MIN_SEPARATION_M, math.dist(points[listener], points[advertiser])
         )
-        predicted = TX_POWER_AT_1M - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+        predicted = (
+            TX_POWER_AT_1M
+            - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+            - floor_penalty * _floors_apart(levels[listener], levels[advertiser])
+        )
         # A link carries both radios' gain, so split the discrepancy between them.
         half = (observed - predicted) / 2
         per_radio[listener].append(half)
@@ -443,10 +531,18 @@ def _rms_residual(
     gains: list[float],
     readings: list[tuple[int, int, float]],
     links: list[tuple[int, int, float]],
+    radio_levels: list[float | None] | None = None,
+    floor_penalty: float = 0.0,
 ) -> float:
     """RMS of the dB residuals: fit quality in the units it was measured in."""
     total = 0.0
     count = 0
+    levels = radio_levels or [None] * len(points)
+    beacon_levels = (
+        _beacon_levels(beacon_points, points, levels)
+        if floor_penalty
+        else [None] * len(beacon_points)
+    )
     for radio, beacon, observed in readings:
         distance = max(
             MIN_SEPARATION_M, math.dist(points[radio], beacon_points[beacon])
@@ -455,6 +551,7 @@ def _rms_residual(
             TX_POWER_AT_1M
             + gains[radio]
             - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+            - floor_penalty * _floors_apart(levels[radio], beacon_levels[beacon])
         )
         total += (observed - predicted) ** 2
         count += 1
@@ -467,6 +564,7 @@ def _rms_residual(
             + gains[listener]
             + gains[advertiser]
             - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+            - floor_penalty * _floors_apart(levels[listener], levels[advertiser])
         )
         total += (observed - predicted) ** 2
         count += 1

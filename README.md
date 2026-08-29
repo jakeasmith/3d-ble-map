@@ -182,3 +182,24 @@ should work and it breaks the panel: Home Assistant serves the frontend through
 aiohttp's static handler, which does not follow a symlink out of the directory it
 registered. Every asset 404s, the custom element never defines, and the page
 hangs on a blank panel with no obvious cause. Copy the directory.
+
+## Validating against reality
+
+`validation/` scores the solver against approximate anchor positions read off a
+floor plan. **That floor plan is a yardstick, never an input.** The integration
+has to work in homes with no plan and no surveyed positions, so measured
+coordinates must not leak into the solver — they would make it accurate in one
+house and useless everywhere else.
+
+```bash
+# capture the recorder's raw view from a running Home Assistant
+ha ws threed_ble_map/raw_observations '{}' > raw.json
+python3 validation/score.py raw.json
+```
+
+The layout is relative, so it is Procrustes-aligned onto the truth before
+scoring. Scale is reported but deliberately not fitted away — getting the scale
+right is part of the job.
+
+Room centres are only good to about +/- 1.5 m, since the hardware sits on a wall
+rather than mid-room. A result better than that is not measurably better.
