@@ -41,7 +41,22 @@ proxies advertise on a MAC a few digits off their network MAC, so the lookup
 misses on some hardware; assign the area on the device itself and it will fill in
 once the two match.
 
-Adapters refresh every 5 seconds.
+### Signals
+
+Below the adapters, the top 20 BLE addresses ranked by how many radios currently
+hear them, because that count is what decides whether a device can be placed at
+all: three radios are enough for a 2D fix, four with vertical separation for 3D.
+The **Radios** badge turns green at three.
+
+| Column | Meaning |
+| --- | --- |
+| Name | Advertised local name, or `unnamed` — most tags advertise no name |
+| Address | The device's BLE address |
+| Radios | How many scanners currently hear it |
+| Best RSSI | Strongest single reading across all scanners, in dBm |
+| Heard by | Each scanner hearing it, strongest first, with its RSSI |
+
+Both tables refresh every 5 seconds.
 
 ## Requirements
 

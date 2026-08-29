@@ -10,3 +10,8 @@ STATIC_URL_BASE = f"/{DOMAIN}_frontend"
 PANEL_JS_FILENAME = "panel.js"
 
 WS_LIST_ADAPTERS = f"{DOMAIN}/adapters"
+WS_LIST_SIGNALS = f"{DOMAIN}/signals"
+
+# How many signals the panel asks for by default.
+DEFAULT_SIGNAL_LIMIT = 20
+MAX_SIGNAL_LIMIT = 200
