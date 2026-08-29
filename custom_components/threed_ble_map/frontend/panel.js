@@ -229,6 +229,11 @@ class ThreeDBleMapPanel extends HTMLElement {
         <div class="card canvas-card"><canvas id="scene"></canvas></div>
         <div class="hint">Drag to orbit · scroll to zoom · solid lines are direct
           radio-to-radio links, dashed lines are inferred from shared beacons.</div>
+        <h2>Radios</h2>
+        <div class="sub">Gain is how far each radio reads from the group average,
+          solved from the data rather than assumed. A radio reading hot would
+          otherwise be placed too close to everything it hears.</div>
+        <div class="card" id="radios"></div>
         <h2>Pair distances</h2>
         <div class="card" id="pairs"></div>`;
       this._scene = new AnchorScene(this.shadowRoot.getElementById("scene"));
@@ -236,6 +241,10 @@ class ThreeDBleMapPanel extends HTMLElement {
     }
 
     this.shadowRoot.getElementById("stats").innerHTML = this._mapStats(map);
+    this.shadowRoot.getElementById("radios").innerHTML = this._radioTable(
+      map,
+      colors,
+    );
     this.shadowRoot.getElementById("pairs").innerHTML = this._pairTable(
       map,
       colors,
@@ -277,6 +286,11 @@ class ThreeDBleMapPanel extends HTMLElement {
         map.stress === null ? "—" : `${(map.stress * 100).toFixed(1)}%`,
       ],
       ["Inferred links", `${inferred} of ${map.pairs.length}`],
+      [
+        "Fit residual",
+        map.residual_db === null ? "—" : `${map.residual_db} dB`,
+      ],
+      ["Calibrated", map.refined ? `${map.beacons_used} beacons` : "not enough data"],
     ];
     const stats = cards
       .map(
@@ -289,6 +303,27 @@ class ThreeDBleMapPanel extends HTMLElement {
       ? `<div class="card"><div class="msg err">${escapeHtml(map.error)}</div></div>`
       : "";
     return stats + warning;
+  }
+
+  _radioTable(map, colors) {
+    const rows = map.anchors
+      .map((anchor) => {
+        const gain = map.gains ? map.gains[anchor.source] : undefined;
+        const color = colors.get(anchor.floor) || UNKNOWN_FLOOR_COLOR;
+        return `
+      <tr>
+        <td><span class="dot" style="background:${color}"></span>${escapeHtml(anchor.label)}</td>
+        <td>${anchor.area ? escapeHtml(anchor.area) : dash()}</td>
+        <td>${anchor.floor ? escapeHtml(anchor.floor) : dash()}</td>
+        <td class="num">${gain === undefined ? dash() : `${gain > 0 ? "+" : ""}${gain} dB`}</td>
+        <td class="num">${anchor.tracked_beacons}</td>
+      </tr>`;
+      })
+      .join("");
+    return `<table><thead><tr>
+        <th>Radio</th><th>Area</th><th>Floor</th>
+        <th class="num">Gain</th><th class="num">Beacons tracked</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   _pairTable(map, colors) {
@@ -375,6 +410,7 @@ const STYLES = `
   }
   .count.solvable { background: rgba(76,175,80,.16); color: var(--success-color, #4caf50); }
   .muted { color: var(--secondary-text-color); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
   .heard { color: var(--secondary-text-color); font-size: 13px; white-space: normal; }
   .msg { padding: 24px; color: var(--secondary-text-color); }
   .msg.err { color: var(--error-color, #f44336); }

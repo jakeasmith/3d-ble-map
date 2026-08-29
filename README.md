@@ -101,6 +101,15 @@ Solid lines are direct radio-to-radio links; dashed lines are inferred. **Fit
 error** is Kruskal stress — the mismatch between the estimated distances and the
 layout drawn. Under ~10% is a usable shape.
 
+**Caveat on the gain figures.** The synthetic tests show the solver recovers a
+radio's offset cleanly when the offset is the only thing making it read
+differently. In a real house it is not: a radio behind a wall hears everything
+weakly, and the solver has limited ability to tell "quiet radio" from "radio with
+things in the way". Read the gain column as a correction that measurably improves
+the fit, not as a calibrated antenna measurement. On the house this was built
+against the spread came out at about 11 dB, which at n=2.5 is a factor of 2.7 in
+implied distance — far too large to leave uncorrected either way.
+
 **Known limitation: the vertical axis is stretched.** A floor between two
 radios costs signal that the path-loss model books as distance, so cross-floor
 pairs read further apart than they are. On the two-storey house this was built
