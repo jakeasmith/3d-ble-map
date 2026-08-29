@@ -101,9 +101,19 @@ RESTART_JITTER = 0.4
 # attenuation. Left uncapped it settles at 8 dB and over-corrects the layout to
 # 0.83x true scale.
 #
-# CAVEAT: 3 dB is validated against exactly one house. It is a hypothesis about
-# building construction, not a measured universal, and wants checking somewhere
-# with a different floor assembly.
+# A beacon's own storey is unknown, so it is taken from whichever radio floor its
+# solved height sits nearest. That is circular -- the vertical axis feeding the
+# term meant to fix the vertical axis -- and correcting only the radio-to-radio
+# links, where both storeys are certain, avoids it. That variant was tried: it
+# scores marginally better on this house and far worse on synthetic data,
+# because beacon paths outnumber links by an order of magnitude and leaving
+# their floor loss uncorrected wrecks the gain estimates. The circular version
+# wins on the evidence available.
+#
+# CAVEAT: validated against one house and one synthetic model that demonstrably
+# disagree with each other. Treat 3 dB as a working figure, not a measured
+# constant -- distinguishing candidates needs a better yardstick than room
+# centres, which are only good to about +/- 1.5 m.
 FLOOR_PENALTY_DB = 3.0
 
 

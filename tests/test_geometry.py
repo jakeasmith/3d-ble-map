@@ -63,6 +63,11 @@ BEACON_COUNT = 120
 # to a different figure from the solver's own prior (refine.FLOOR_PENALTY_DB),
 # so these tests measure how the solver copes with a prior that is approximately
 # right rather than exactly right.
+#
+# The solver corrects floor loss only on the radio-to-radio links, so loss on the
+# beacon paths is uncorrected and heavy attenuation degrades the layout: at 18 dB
+# the shape error is several metres. 6 dB is a reasonable residential figure and
+# the regime the solver is built for.
 TRUE_FLOOR_PENALTY_DB = 6.0
 
 
