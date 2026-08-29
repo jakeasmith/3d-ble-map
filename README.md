@@ -157,23 +157,28 @@ Frontend and backend iterate very differently, and knowing which is which saves
 a lot of waiting.
 
 **Frontend (`frontend/*.js`) needs no restart.** The files are read from disk per
-request and served with `cache_headers=False`, so a real browser reload picks up
-a change. Note that clicking through Home Assistant's sidebar is client-side
-routing and does *not* re-fetch modules — press F5 (or Ctrl/Cmd-Shift-R) to force
-an actual document load.
+request, so copying a new one over is the whole deploy. The browser is the part
+that needs convincing: the panel's module URL carries a cache-busting token
+fixed at registration, so it does not change when you edit a file. Clicking
+through the sidebar is client-side routing and re-uses the cached module; a plain
+reload usually does too. Use **Ctrl/Cmd-Shift-R** to bypass the cache.
 
 **Backend (`*.py`) needs a restart.** Python caches modules in `sys.modules`, and
 reloading the config entry re-runs setup without re-importing. There is no
 official hot-reload for custom integrations.
 
-To make deploys a single command, clone the repo somewhere persistent on the HA
-host and symlink it into place, so `git pull` *is* the deploy:
+Keep a clone on the Home Assistant host and deploy with a pull and a copy:
 
 ```bash
 git clone https://github.com/jakeasmith/3d-ble-map /config/3d-ble-map
-ln -s /config/3d-ble-map/custom_components/threed_ble_map \
-      /config/custom_components/threed_ble_map
+
+# thereafter, from the Terminal add-on:
+git -C /config/3d-ble-map pull && \
+  cp -r /config/3d-ble-map/custom_components/threed_ble_map /config/custom_components/
 ```
 
-Then from the Terminal add-on: `git -C /config/3d-ble-map pull`, and reload the
-browser. Restart Home Assistant only when Python changed.
+**Do not symlink the integration into `custom_components/`.** It looks like it
+should work and it breaks the panel: Home Assistant serves the frontend through
+aiohttp's static handler, which does not follow a symlink out of the directory it
+registered. Every asset 404s, the custom element never defines, and the page
+hangs on a blank panel with no obvious cause. Copy the directory.
