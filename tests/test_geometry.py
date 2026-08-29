@@ -41,12 +41,17 @@ refine = _load("refine")
 
 # A two-storey house, metres. Mirrors the real deployment: five anchors, three
 # of which advertise and so can be heard directly by the others.
+#
+# Radios on one storey sit at deliberately different heights -- on a shelf, on a
+# desk, on the floor. The solver leans on "same floor, same height" as a prior,
+# so the truth must not satisfy it exactly or the tests would only prove the
+# prior agrees with itself.
 TRUTH = {
     "garage": (0.0, 0.0, 0.0),
-    "office": (8.0, 1.0, 0.0),
-    "dining": (5.0, 7.0, 0.0),
-    "mainbed": (7.0, 5.0, 3.0),
-    "stretch": (2.0, 6.0, 3.0),
+    "office": (8.0, 1.0, 0.9),
+    "dining": (5.0, 7.0, 1.6),
+    "mainbed": (7.0, 5.0, 3.2),
+    "stretch": (2.0, 6.0, 4.0),
 }
 LEVELS = {"garage": 1, "office": 1, "dining": 1, "mainbed": 2, "stretch": 2}
 ADVERTISERS = ["office", "dining", "stretch"]

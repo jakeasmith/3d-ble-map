@@ -17,6 +17,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
+    BEACON_MAX_SPREAD_DB,
+    BEACON_MIN_SAMPLES,
     RECORDER_INTERVAL,
     RECORDER_SMOOTHING,
     RECORDER_STALE_AFTER,
@@ -32,13 +34,20 @@ _MAC_TOLERANCE = 4
 
 @dataclass
 class _Reading:
-    """One smoothed RSSI track."""
+    """One smoothed RSSI track, with a running measure of how jumpy it is."""
 
     rssi: float
     samples: int = 0
+    spread: float = 0.0
     updated: float = field(default_factory=time.monotonic)
 
     def update(self, rssi: float, smoothing: float) -> None:
+        # Mean absolute deviation, smoothed the same way as the value itself.
+        # A beacon sitting still varies by the radio noise floor; one being
+        # carried around swings far wider, and it is the wide ones that poison
+        # a solve which assumes everything is stationary.
+        deviation = abs(rssi - self.rssi)
+        self.spread = smoothing * deviation + (1 - smoothing) * self.spread
         self.rssi = smoothing * rssi + (1 - smoothing) * self.rssi
         self.samples += 1
         self.updated = time.monotonic()
@@ -112,16 +121,33 @@ class SignalRecorder:
         """Seconds of data collected so far."""
         return 0.0 if self.started is None else time.monotonic() - self.started
 
-    def observations(self, sources: list[str]) -> dict[str, dict[str, float]]:
-        """anchor -> {beacon address: smoothed RSSI}, excluding the anchors."""
+    def observations(
+        self, sources: list[str], stable_only: bool = True
+    ) -> dict[str, dict[str, float]]:
+        """anchor -> {beacon address: smoothed RSSI}, excluding the anchors.
+
+        Beacons whose signal is still settling, or which swing too much to be
+        sitting still, are left out: the solver assumes a static world, so a
+        beacon in someone's pocket drags the layout around with it.
+        """
         anchor_addresses = set(sources)
+        excluded = self.unstable(sources) if stable_only else set()
         return {
             source: {
                 address: reading.rssi
                 for address, reading in self._readings.get(source, {}).items()
                 if not _matches_any(address, anchor_addresses)
+                and address not in excluded
             }
             for source in sources
+        }
+
+    def unstable(self, sources: list[str]) -> set[str]:
+        """Beacons too jumpy, or too new, to treat as fixed points."""
+        return {
+            address
+            for address, (spread, samples) in self.stability(sources).items()
+            if samples < BEACON_MIN_SAMPLES or spread > BEACON_MAX_SPREAD_DB
         }
 
     def direct_links(self, sources: list[str]) -> dict[tuple[str, str], list[float]]:
@@ -137,6 +163,18 @@ class SignalRecorder:
     def sample_counts(self, sources: list[str]) -> dict[str, int]:
         """How many beacons each anchor currently has a track for."""
         return {source: len(self._readings.get(source, {})) for source in sources}
+
+    def stability(self, sources: list[str]) -> dict[str, tuple[float, int]]:
+        """beacon address -> (worst spread in dB across radios, sample count)."""
+        result: dict[str, tuple[float, int]] = {}
+        for source in sources:
+            for address, reading in self._readings.get(source, {}).items():
+                spread, samples = result.get(address, (0.0, 0))
+                result[address] = (
+                    max(spread, reading.spread),
+                    max(samples, reading.samples),
+                )
+        return result
 
 
 def _split_mac(value: str) -> tuple[str, int] | None:

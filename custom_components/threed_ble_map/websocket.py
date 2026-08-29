@@ -314,12 +314,15 @@ def ws_anchor_map(
     if not ready:
         result = {"positions": {}, "pairs": [], "stress": None, "error": None}
     else:
+        observations = recorder.observations(ordered)
         result = geometry.solve_layout(
             ordered,
             recorder.direct_links(ordered),
-            recorder.observations(ordered),
+            observations,
             levels,
         )
+        result["rejected_beacons"] = len(recorder.unstable(ordered))
+        result["tracked_beacons"] = len(recorder.stability(ordered))
 
     connection.send_result(
         msg["id"],

@@ -41,8 +41,21 @@ from .geometry import (
     TX_POWER_AT_1M,
 )
 
-# Beacons heard by fewer radios than this constrain little and cost the same.
-MIN_RADIOS_PER_BEACON = 3
+# A beacon costs three unknowns -- its own position -- and supplies one
+# observation per radio that hears it. So a beacon heard by exactly three radios
+# nets out at zero: it pins itself and constrains nothing. Four is the first
+# count that actually helps place a radio, and excluding the rest removes noise
+# without losing information.
+MIN_RADIOS_PER_BEACON = 4
+
+# Radios on one storey share a floor, so their heights should agree. Home
+# Assistant knows which floor each radio is on, and that is a much stronger fact
+# than anything RSSI can say about the vertical axis -- a floor between two
+# radios eats signal that the path-loss model books as distance, which is what
+# stretches the layout. This weights the "same floor, same height" spring
+# against a radio's observations; 1.0 makes it worth as much as everything else
+# that radio hears put together.
+FLOOR_COHESION = 0.8
 
 # Residuals beyond this many dB are treated as outliers -- a wall, a reflection,
 # a beacon that moved mid-window -- and are downweighted rather than chased.
@@ -64,6 +77,7 @@ def refine_layout(
     positions: dict[str, dict[str, float]],
     observations: dict[str, dict[str, float]],
     direct_rssi: dict[tuple[str, str], list[float]],
+    levels: dict[str, float] | None = None,
 ) -> dict[str, Any] | None:
     """Refine an initial layout, solving per-radio gain at the same time.
 
@@ -103,6 +117,8 @@ def refine_layout(
         for beacon in beacons
     ]
 
+    floor_groups = _floor_groups(radios, levels or {})
+
     before = _rms_residual(points, beacon_points, gains, readings, links)
     current = before
 
@@ -111,7 +127,9 @@ def refine_layout(
             points, beacon_points, gains, readings, links, len(radios)
         )
         for _ in range(SWEEPS_PER_ROUND):
-            _majorize(points, beacon_points, gains, readings, links)
+            _majorize(
+                points, beacon_points, gains, readings, links, floor_groups
+            )
         current = _rms_residual(points, beacon_points, gains, readings, links)
 
     if current >= before:
@@ -129,12 +147,24 @@ def refine_layout(
     }
 
 
+def _floor_groups(
+    radios: Sequence[str], levels: dict[str, float]
+) -> list[list[int]]:
+    """Indices of the radios sharing each building floor, groups of 2 or more."""
+    by_level: dict[float, list[int]] = {}
+    for i, radio in enumerate(radios):
+        if (level := levels.get(radio)) is not None:
+            by_level.setdefault(level, []).append(i)
+    return [group for group in by_level.values() if len(group) > 1]
+
+
 def _majorize(
     points: list[list[float]],
     beacon_points: list[list[float]],
     gains: list[float],
     readings: list[tuple[int, int, float]],
     links: list[tuple[int, int, float]],
+    floor_groups: list[list[int]],
 ) -> None:
     """One SMACOF sweep: move every point to where its springs want it.
 
@@ -168,6 +198,18 @@ def _majorize(
             continue
         _pull(points[listener], points[advertiser], rest, targets[listener], weights, listener)
         _pull(points[advertiser], points[listener], rest, targets[advertiser], weights, advertiser)
+
+    # Radios on one storey are at the same height. Pull each towards its floor's
+    # mean, as a spring alongside the observations rather than a hard clamp, so
+    # a genuine height difference can still show through.
+    for group in floor_groups:
+        mean_z = sum(points[i][2] for i in group) / len(group)
+        for i in group:
+            pull = FLOOR_COHESION * max(1.0, weights[i])
+            targets[i][0] += pull * points[i][0]
+            targets[i][1] += pull * points[i][1]
+            targets[i][2] += pull * mean_z
+            weights[i] += pull
 
     for i, weight in enumerate(weights):
         if weight > 0:

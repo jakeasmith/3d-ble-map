@@ -28,3 +28,10 @@ RECORDER_STALE_AFTER = timedelta(minutes=10)
 
 # The layout is only worth showing once a little history has accumulated.
 MIN_RECORDING_SECONDS = 30
+
+# Beacon quality. A beacon that is being carried around breaks the assumption
+# that the geometry is static, and its readings pull the layout with it. Spread
+# is the smoothed mean absolute deviation of its RSSI; a stationary beacon sits
+# near the radio noise floor, a moving one swings far wider.
+BEACON_MAX_SPREAD_DB = 6.0
+BEACON_MIN_SAMPLES = 4

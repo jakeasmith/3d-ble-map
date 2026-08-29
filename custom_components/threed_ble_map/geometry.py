@@ -91,7 +91,7 @@ def solve_layout(
         anchor: {"x": p[0], "y": p[1], "z": p[2]}
         for anchor, p in zip(anchors, coords)
     }
-    refined = refine_layout(anchors, seed, observations, direct_rssi)
+    refined = refine_layout(anchors, seed, observations, direct_rssi, levels)
     if refined is not None:
         coords = refined["positions"]
 
