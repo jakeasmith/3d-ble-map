@@ -1,0 +1,336 @@
+"""Joint solve for radio positions, per-radio gain, and beacon positions.
+
+This is a force-directed layout, in the metric sense. Every RSSI reading is a
+spring between a radio and a beacon whose rest length is the distance that
+reading implies. Relaxing all the springs at once is stress majorization
+(SMACOF): each point moves to the average of where its springs want it, which is
+guaranteed never to increase the total stress. There is no learning rate and no
+line search to tune -- the update is the algorithm.
+
+The reason to do this at all is calibration. geometry.py's pairwise fit assumes
+every radio converts RSSI to distance identically. They do not: antenna gain,
+shielding and enclosure differ per board, so -70 dBm on one radio is not the same
+distance as -70 dBm on another, and treating that offset as zero bakes a
+per-radio bias into the layout. The offset is only identifiable if it is solved
+for, and each beacon heard by three or more radios adds observations faster than
+it adds unknowns, so positions and gains can be recovered together:
+
+    rssi(radio, beacon) = TX + gain[radio] - 10 n log10(|p_radio - q_beacon|)
+
+Gain is linear in that model, so it has a closed form -- a radio's best offset is
+just how far its readings sit from the model, taken as a median so one
+wall-blocked beacon cannot drag a whole radio's calibration. Positions are
+non-linear and get the SMACOF sweeps. The two alternate.
+
+Two degeneracies are fixed explicitly: adding a constant to every gain is
+indistinguishable from scaling every distance, so gains are held to zero mean;
+and the whole solution is free to rotate, so orientation is applied afterwards by
+geometry._orient_by_level.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any, Sequence
+
+from .geometry import (
+    MAX_DISTANCE_M,
+    MIN_DISTANCE_M,
+    PATH_LOSS_EXPONENT,
+    TX_POWER_AT_1M,
+)
+
+# Beacons heard by fewer radios than this constrain little and cost the same.
+MIN_RADIOS_PER_BEACON = 3
+
+# Residuals beyond this many dB are treated as outliers -- a wall, a reflection,
+# a beacon that moved mid-window -- and are downweighted rather than chased.
+HUBER_DELTA_DB = 6.0
+
+# A radio's gain offset realistically lives within this band. Anything larger is
+# the fit laundering a geometry error into a calibration term.
+MAX_GAIN_DB = 12.0
+
+# Below this two points are indistinguishable and the spring direction is noise.
+MIN_SEPARATION_M = 0.3
+
+ROUNDS = 40
+SWEEPS_PER_ROUND = 8
+
+
+def refine_layout(
+    anchors: Sequence[str],
+    positions: dict[str, dict[str, float]],
+    observations: dict[str, dict[str, float]],
+    direct_rssi: dict[tuple[str, str], list[float]],
+) -> dict[str, Any] | None:
+    """Refine an initial layout, solving per-radio gain at the same time.
+
+    Returns None when there is not enough shared data, or when refinement fails
+    to improve on the input, so the caller can fall back to the pairwise fit.
+    """
+    radios = list(anchors)
+    index = {radio: i for i, radio in enumerate(radios)}
+
+    beacons = _shared_beacons(radios, observations)
+    if len(beacons) < len(radios):
+        return None
+
+    points = [
+        [positions[radio]["x"], positions[radio]["y"], positions[radio]["z"]]
+        for radio in radios
+    ]
+    gains = [0.0] * len(radios)
+
+    readings = [
+        (index[radio], b, observations[radio][beacon])
+        for b, beacon in enumerate(beacons)
+        for radio in radios
+        if beacon in observations[radio]
+    ]
+    links = [
+        (index[listener], index[advertiser], sum(values) / len(values))
+        for (listener, advertiser), values in direct_rssi.items()
+        if listener in index and advertiser in index
+    ]
+    if not readings:
+        return None
+
+    rng = random.Random(0)
+    beacon_points = [
+        _initial_beacon_position(radios, observations, beacon, points, rng)
+        for beacon in beacons
+    ]
+
+    before = _rms_residual(points, beacon_points, gains, readings, links)
+    current = before
+
+    for _ in range(ROUNDS):
+        gains = _solve_gains(
+            points, beacon_points, gains, readings, links, len(radios)
+        )
+        for _ in range(SWEEPS_PER_ROUND):
+            _majorize(points, beacon_points, gains, readings, links)
+        current = _rms_residual(points, beacon_points, gains, readings, links)
+
+    if current >= before:
+        # Refinement is an optimisation, not an article of faith. If it did not
+        # beat the seed layout, say so and let the caller keep the seed.
+        return None
+
+    return {
+        "positions": [list(point) for point in points],
+        "gains": {radio: round(gains[i], 1) for i, radio in enumerate(radios)},
+        "residual_db": round(current, 2),
+        "seed_residual_db": round(before, 2),
+        "beacons_used": len(beacons),
+        "observations": len(readings) + len(links),
+    }
+
+
+def _majorize(
+    points: list[list[float]],
+    beacon_points: list[list[float]],
+    gains: list[float],
+    readings: list[tuple[int, int, float]],
+    links: list[tuple[int, int, float]],
+) -> None:
+    """One SMACOF sweep: move every point to where its springs want it.
+
+    For each edge, the neighbour contributes the position this point would sit
+    at if that spring alone were satisfied -- the neighbour's position, offset by
+    the spring's rest length along the current direction. Averaging those over a
+    point's edges is the Guttman transform, and it cannot increase stress.
+    """
+    targets = [[0.0] * 3 for _ in points]
+    weights = [0.0] * len(points)
+    beacon_targets = [[0.0] * 3 for _ in beacon_points]
+    beacon_weights = [0.0] * len(beacon_points)
+
+    for radio, beacon, observed in readings:
+        rest = _rest_length(observed - gains[radio])
+        if rest is None:
+            continue
+        _pull(points[radio], beacon_points[beacon], rest, targets[radio], weights, radio)
+        _pull(
+            beacon_points[beacon],
+            points[radio],
+            rest,
+            beacon_targets[beacon],
+            beacon_weights,
+            beacon,
+        )
+
+    for listener, advertiser, observed in links:
+        rest = _rest_length(observed - gains[listener] - gains[advertiser])
+        if rest is None:
+            continue
+        _pull(points[listener], points[advertiser], rest, targets[listener], weights, listener)
+        _pull(points[advertiser], points[listener], rest, targets[advertiser], weights, advertiser)
+
+    for i, weight in enumerate(weights):
+        if weight > 0:
+            points[i] = [value / weight for value in targets[i]]
+    for b, weight in enumerate(beacon_weights):
+        if weight > 0:
+            beacon_points[b] = [value / weight for value in beacon_targets[b]]
+
+
+def _pull(
+    point: list[float],
+    neighbour: list[float],
+    rest: float,
+    target: list[float],
+    weights: list[float],
+    index: int,
+) -> None:
+    """Accumulate one spring's preferred position for `point`."""
+    delta = [point[axis] - neighbour[axis] for axis in range(3)]
+    distance = math.sqrt(sum(value * value for value in delta))
+    if distance < MIN_SEPARATION_M:
+        # Degenerate direction; any unit vector will do and this one is stable.
+        delta, distance = [1.0, 0.0, 0.0], 1.0
+
+    # Downweight edges the model already disagrees with badly, so a wall-blocked
+    # reading bends the layout less than a clean one. This is the Huber weight
+    # applied to the residual in dB, in IRLS form.
+    residual_db = abs(
+        10 * PATH_LOSS_EXPONENT * math.log10(max(distance, MIN_SEPARATION_M) / rest)
+    )
+    weight = 1.0 if residual_db <= HUBER_DELTA_DB else HUBER_DELTA_DB / residual_db
+
+    for axis in range(3):
+        target[axis] += weight * (neighbour[axis] + rest * delta[axis] / distance)
+    weights[index] += weight
+
+
+def _rest_length(rssi: float) -> float | None:
+    """Spring rest length: the distance this reading implies, or None if absurd."""
+    distance = 10 ** ((TX_POWER_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT))
+    if MIN_DISTANCE_M <= distance <= MAX_DISTANCE_M:
+        return distance
+    return None
+
+
+def _solve_gains(
+    points: list[list[float]],
+    beacon_points: list[list[float]],
+    gains: list[float],
+    readings: list[tuple[int, int, float]],
+    links: list[tuple[int, int, float]],
+    radio_count: int,
+) -> list[float]:
+    """Closed-form gain update: each radio's median residual against the model.
+
+    RSSI is linear in the gain term, so the best offset for a radio is how far
+    its readings sit from the model. A median rather than a mean keeps one
+    wall-blocked beacon from dragging a radio's whole calibration.
+    """
+    per_radio: list[list[float]] = [[] for _ in range(radio_count)]
+
+    for radio, beacon, observed in readings:
+        distance = max(
+            MIN_SEPARATION_M, math.dist(points[radio], beacon_points[beacon])
+        )
+        predicted = TX_POWER_AT_1M - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+        per_radio[radio].append(observed - predicted)
+
+    for listener, advertiser, observed in links:
+        distance = max(
+            MIN_SEPARATION_M, math.dist(points[listener], points[advertiser])
+        )
+        predicted = TX_POWER_AT_1M - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+        # A link carries both radios' gain, so split the discrepancy between them.
+        half = (observed - predicted) / 2
+        per_radio[listener].append(half)
+        per_radio[advertiser].append(half)
+
+    updated = [
+        _median(values) if values else gains[i] for i, values in enumerate(per_radio)
+    ]
+    updated = [max(-MAX_GAIN_DB, min(MAX_GAIN_DB, value)) for value in updated]
+
+    # Hold the gains to zero mean: a constant added to all of them is
+    # indistinguishable from scaling every distance.
+    mean_gain = sum(updated) / len(updated)
+    return [value - mean_gain for value in updated]
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _shared_beacons(
+    radios: Sequence[str], observations: dict[str, dict[str, float]]
+) -> list[str]:
+    """Beacons heard by enough radios to constrain anything."""
+    counts: dict[str, int] = {}
+    for radio in radios:
+        for beacon in observations.get(radio, {}):
+            counts[beacon] = counts.get(beacon, 0) + 1
+    return sorted(b for b, count in counts.items() if count >= MIN_RADIOS_PER_BEACON)
+
+
+def _initial_beacon_position(
+    radios: Sequence[str],
+    observations: dict[str, dict[str, float]],
+    beacon: str,
+    points: list[list[float]],
+    rng: random.Random,
+) -> list[float]:
+    """Start a beacon at the signal-weighted centroid of the radios hearing it."""
+    total = 0.0
+    position = [0.0, 0.0, 0.0]
+    for i, radio in enumerate(radios):
+        if (rssi := observations.get(radio, {}).get(beacon)) is None:
+            continue
+        # Louder means closer, so weight by strength above the noise floor.
+        weight = max(0.1, rssi + 100.0)
+        total += weight
+        for axis in range(3):
+            position[axis] += weight * points[i][axis]
+    if total <= 0:
+        return [rng.uniform(-1, 1) for _ in range(3)]
+    # Jitter breaks the symmetry of beacons that start on top of each other.
+    return [position[axis] / total + rng.uniform(-0.5, 0.5) for axis in range(3)]
+
+
+def _rms_residual(
+    points: list[list[float]],
+    beacon_points: list[list[float]],
+    gains: list[float],
+    readings: list[tuple[int, int, float]],
+    links: list[tuple[int, int, float]],
+) -> float:
+    """RMS of the dB residuals: fit quality in the units it was measured in."""
+    total = 0.0
+    count = 0
+    for radio, beacon, observed in readings:
+        distance = max(
+            MIN_SEPARATION_M, math.dist(points[radio], beacon_points[beacon])
+        )
+        predicted = (
+            TX_POWER_AT_1M
+            + gains[radio]
+            - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+        )
+        total += (observed - predicted) ** 2
+        count += 1
+    for listener, advertiser, observed in links:
+        distance = max(
+            MIN_SEPARATION_M, math.dist(points[listener], points[advertiser])
+        )
+        predicted = (
+            TX_POWER_AT_1M
+            + gains[listener]
+            + gains[advertiser]
+            - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+        )
+        total += (observed - predicted) ** 2
+        count += 1
+    return math.sqrt(total / count) if count else 0.0

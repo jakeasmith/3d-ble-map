@@ -74,8 +74,28 @@ How it works:
    have one.
 2. **Embedding.** Classical multidimensional scaling places the anchors so their
    separations match those distances as closely as possible.
-3. **Orientation.** MDS returns an arbitrary rotation, so the result is rotated
+3. **Refinement.** The pairwise step assumes every radio converts RSSI to
+   distance identically. They do not — antenna gain, shielding and enclosure
+   differ per board, so -70 dBm on one radio is not the same distance as -70 dBm
+   on another. So the layout is then relaxed against every individual reading as
+   a force-directed problem: each reading is a spring between a radio and a
+   beacon whose rest length is the distance it implies, solved by stress
+   majorization (SMACOF), with each radio's gain offset solved alongside the
+   positions. Gains are held to zero mean, since a constant added to all of them
+   is indistinguishable from scaling every distance.
+4. **Orientation.** MDS returns an arbitrary rotation, so the result is rotated
    to put the axis separating your Home Assistant floors vertical.
+
+Refinement only replaces the pairwise layout if it actually fits the data
+better; otherwise the pairwise result stands.
+
+### Radios are not assumed to be fixed
+
+Nothing is persisted. Every solve re-reads the live scanner list, so a radio that
+goes away drops out and a new one is picked up with no configuration. A radio
+that is moved corrects itself: the smoothed RSSI decays the old position's
+influence to about 5% within a minute. Beacons nobody has heard for ten minutes
+are forgotten.
 
 Solid lines are direct radio-to-radio links; dashed lines are inferred. **Fit
 error** is Kruskal stress — the mismatch between the estimated distances and the
@@ -100,7 +120,12 @@ around the vertical axis are arbitrary: the *shape* is the output, not the
 coordinates. Treat it as a starting point to correct by hand, not a survey.
 
 Against synthetic ground truth (5 anchors, two storeys, 120 beacons, 2 dB noise)
-the recovered shape had ~0.9 m RMS error across a 9 m house.
+the recovered shape had ~0.9 m RMS error across a 9 m house. With the radios
+deliberately miscalibrated by -6 to +5 dB, the solver recovers each radio's
+offset to 0.58 dB mean error and holds shape error to 1.09 m; ignoring
+calibration instead gives 3.07 m.
+
+Run the checks with `python3 tests/test_geometry.py`.
 
 ## Requirements
 

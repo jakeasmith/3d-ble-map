@@ -67,27 +67,34 @@ def solve_layout(
     levels: anchor id -> building floor level, used only to orient the result.
     """
     if len(anchors) < 3:
-        return {
-            "positions": {},
-            "pairs": [],
-            "stress": None,
-            "error": "At least 3 anchors are needed to estimate a layout.",
-        }
+        return _empty("At least 3 anchors are needed to estimate a layout.")
 
     pairs = _estimate_pairs(anchors, direct_rssi, observations)
     matrix, missing = _distance_matrix(anchors, pairs)
     if missing:
-        return {
-            "positions": {},
-            "pairs": pairs,
-            "stress": None,
-            "error": (
-                f"No distance estimate for {missing} anchor pair(s). They neither "
-                "hear each other nor share enough beacons."
-            ),
-        }
+        return _empty(
+            f"No distance estimate for {missing} anchor pair(s). They neither "
+            "hear each other nor share enough beacons.",
+            pairs=pairs,
+        )
 
     coords = _classical_mds(matrix, dimensions=3)
+    # Stress describes the pairwise stage, so measure it before refinement
+    # moves the points off the pairwise estimates and onto the raw readings.
+    stress = _stress(matrix, coords)
+
+    # The pairwise fit assumes every radio reads RSSI the same way. Refine it
+    # against the raw observations, solving each radio's gain at the same time.
+    from .refine import refine_layout
+
+    seed = {
+        anchor: {"x": p[0], "y": p[1], "z": p[2]}
+        for anchor, p in zip(anchors, coords)
+    }
+    refined = refine_layout(anchors, seed, observations, direct_rssi)
+    if refined is not None:
+        coords = refined["positions"]
+
     coords = _orient_by_level(anchors, coords, levels or {})
 
     return {
@@ -96,8 +103,26 @@ def solve_layout(
             for anchor, p in zip(anchors, coords)
         },
         "pairs": pairs,
-        "stress": _stress(matrix, coords),
+        "stress": stress,
+        "gains": refined["gains"] if refined else {},
+        "residual_db": refined["residual_db"] if refined else None,
+        "beacons_used": refined["beacons_used"] if refined else 0,
+        "refined": refined is not None,
         "error": None,
+    }
+
+
+def _empty(error: str, pairs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """A result carrying the same keys as a solved one, so callers need no guards."""
+    return {
+        "positions": {},
+        "pairs": pairs or [],
+        "stress": None,
+        "gains": {},
+        "residual_db": None,
+        "beacons_used": 0,
+        "refined": False,
+        "error": error,
     }
 
 
