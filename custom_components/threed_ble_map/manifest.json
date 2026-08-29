@@ -1,0 +1,13 @@
+{
+  "domain": "threed_ble_map",
+  "name": "3D BLE Map",
+  "codeowners": ["@jakeasmith"],
+  "config_flow": true,
+  "dependencies": ["bluetooth", "http", "panel_custom", "websocket_api"],
+  "documentation": "https://github.com/jakeasmith/3d-ble-map",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/jakeasmith/3d-ble-map/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

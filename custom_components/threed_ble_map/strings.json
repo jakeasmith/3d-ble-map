@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "3D BLE Map",
+        "description": "Adds a 3D BLE Map panel to the sidebar. No configuration is required."
+      }
+    },
+    "abort": {
+      "already_configured": "3D BLE Map is already set up."
+    }
+  }
+}
