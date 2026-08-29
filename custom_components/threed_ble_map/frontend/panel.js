@@ -365,14 +365,14 @@ class ThreeDBleMapPanel extends HTMLElement {
         return `
       <tr>
         <td>${escapeHtml(beaconLabel(beacon))}</td>
-        <td class="mono">${escapeHtml(beacon.address)}</td>
+        <td class="num">
+          <span class="pill ${vague ? "warn" : "ok"}">±${beacon.uncertainty_m} m</span>
+        </td>
         <td>${beacon.nearest_anchor ? escapeHtml(beacon.nearest_anchor) : dash()}</td>
         <td>${beacon.nearest_area ? escapeHtml(beacon.nearest_area) : dash()}</td>
         <td class="num">${beacon.radios}</td>
         <td class="num">${beacon.rssi === null ? dash() : `${beacon.rssi} dBm`}</td>
-        <td class="num">
-          <span class="pill ${vague ? "warn" : "ok"}">±${beacon.uncertainty_m} m</span>
-        </td>
+        <td class="mono">${escapeHtml(beacon.address)}</td>
       </tr>`;
       })
       .join("");
@@ -382,9 +382,9 @@ class ThreeDBleMapPanel extends HTMLElement {
              Showing the ${BEACON_ROWS} strongest of ${beacons.length} placed.</div>`
         : "";
     return `<table><thead><tr>
-        <th>Beacon</th><th>Address</th><th>Nearest radio</th><th>Area</th>
-        <th class="num">Radios</th><th class="num">Strongest</th>
-        <th class="num">Uncertainty</th>
+        <th>Beacon</th><th class="num">Uncertainty</th><th>Nearest radio</th>
+        <th>Area</th><th class="num">Radios</th><th class="num">Strongest</th>
+        <th>Address</th>
       </tr></thead><tbody>${rows}</tbody></table>${more}`;
   }
 
