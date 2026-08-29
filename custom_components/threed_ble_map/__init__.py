@@ -65,11 +65,17 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
         ]
     )
 
+    # cache_headers=False stops the HTTP layer caching, but the browser still
+    # holds the resolved ES module against its URL. Version the URL by the
+    # bundle's mtime so an edit is actually picked up without a hard reload.
+    panel_js = frontend_dir / PANEL_JS_FILENAME
+    version = await hass.async_add_executor_job(_module_version, panel_js)
+
     await panel_custom.async_register_panel(
         hass,
         webcomponent_name="threed-ble-map-panel",
         frontend_url_path=PANEL_URL_PATH,
-        module_url=f"{STATIC_URL_BASE}/{PANEL_JS_FILENAME}",
+        module_url=f"{STATIC_URL_BASE}/{PANEL_JS_FILENAME}?v={version}",
         sidebar_title=PANEL_TITLE,
         sidebar_icon=PANEL_ICON,
         require_admin=True,
@@ -77,3 +83,11 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
 
     hass.data[_PANEL_REGISTERED] = True
     _LOGGER.debug("Registered %s panel at /%s", PANEL_TITLE, PANEL_URL_PATH)
+
+
+def _module_version(path: Path) -> int:
+    """Cache-busting token for the panel bundle: its modification time."""
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:  # pragma: no cover - the file ships with the integration
+        return 0

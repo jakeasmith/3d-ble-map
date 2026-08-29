@@ -56,7 +56,9 @@ The **Radios** badge turns green at three.
 | Best RSSI | Strongest single reading across all scanners, in dBm |
 | Heard by | Each scanner hearing it, strongest first, with its RSSI |
 
-Both tables refresh every 5 seconds.
+Both tables refresh every 5 seconds. The panel bundle is served with a
+cache-busting token derived from its modification time, so an update takes
+effect on the next page load rather than needing a hard reload.
 
 ## Requirements
 
