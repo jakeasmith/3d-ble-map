@@ -32,6 +32,14 @@ MAX_DISTANCE_M = 60.0
 # A co-observation estimate needs enough shared beacons to mean anything.
 MIN_SHARED_BEACONS = 5
 
+# Below this, a direct reading says more about what is in the way than about
+# distance: a wall or a floor costs tens of dB, and the path-loss model books
+# all of it as range. Measured here, a -96 dBm link between two anchors came out
+# at 26 m in a house whose longest span is nowhere near that, violating the
+# triangle inequality against its neighbours by 15 m. Weak links fall back to
+# the co-observation estimate, which is calibrated on the strong ones.
+RELIABLE_RSSI_FLOOR = -90.0
+
 # Fallback metres-per-dB if there are too few direct links to calibrate against.
 DEFAULT_DB_TO_M = 0.45
 
@@ -115,11 +123,12 @@ def _estimate_pairs(
                 *direct_rssi.get((first, second), []),
                 *direct_rssi.get((second, first), []),
             ]
-            if not readings:
-                continue
             # Links are asymmetric by a few dB, so average the directions
             # rather than trusting whichever one happened to be louder.
-            if (distance := rssi_to_distance(sum(readings) / len(readings))) is not None:
+            usable = [r for r in readings if r >= RELIABLE_RSSI_FLOOR]
+            if not usable:
+                continue
+            if (distance := rssi_to_distance(sum(usable) / len(usable))) is not None:
                 direct[(first, second)] = distance
 
     scale = _calibrate(direct, similarity)
