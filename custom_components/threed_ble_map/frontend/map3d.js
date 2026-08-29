@@ -3,6 +3,18 @@
 // dependency-free and inside Home Assistant's content security policy.
 
 const NODE_RADIUS = 7;
+const BEACON_RADIUS = 3.5;
+
+// A beacon's uncertainty runs to metres, so its ring is frequently wider than
+// the house. Drawing every ring at once was tried and is unreadable: thirty-odd
+// translucent discs cover the canvas and hide the radios they are drawn against.
+// Only the hovered beacon shows its ring, and the figure is in the table too.
+const MAX_HALO_PX = 140;
+
+// One badly-solved beacon can land far outside the house. The view is framed on
+// the radios and stretched only this far to accommodate beacons, so an outlier
+// drifts off the edge instead of shrinking everything else to a dot.
+const MAX_BEACON_EXTENT = 1.35;
 const GRID_DIVISIONS = 6;
 const ANIMATION_MS = 700;
 
@@ -17,28 +29,41 @@ export class AnchorScene {
     this.ctx = canvas.getContext("2d");
     this.nodes = [];
     this.edges = [];
+    this.beacons = [];
     this.azimuth = 0.9;
     this.elevation = 0.45;
     this.zoom = 1;
     this.hovered = null;
     this.showEdges = true;
+    this.showBeacons = true;
     this._frame = null;
     this._bindPointer();
   }
 
-  setData(nodes, edges) {
+  setData(nodes, edges, beacons = []) {
     this.edges = edges;
-    const aligned = this._align(nodes);
+    // Beacons are placed in the same solve as the radios, so they must be spun
+    // by the same rotation. Aligning them independently would slide them
+    // through the house relative to the radios that positioned them.
+    const transform = this._alignment(nodes);
+    const aligned = nodes.map(transform);
+    const alignedBeacons = beacons.map(transform);
     if (!this.nodes.length) {
       this.nodes = aligned;
+      this.beacons = alignedBeacons;
       this.draw();
       return;
     }
-    this._animateTo(aligned);
+    this._animateTo(aligned, alignedBeacons);
   }
 
   setShowEdges(value) {
     this.showEdges = value;
+    this.draw();
+  }
+
+  setShowBeacons(value) {
+    this.showBeacons = value;
     this.draw();
   }
 
@@ -47,12 +72,12 @@ export class AnchorScene {
   // consecutive solves come back arbitrarily spun and the view appears to jump.
   // Applying the rotation and reflection that best match the previous positions
   // is a change of viewpoint only: it leaves every distance untouched.
-  _align(nodes) {
+  _alignment(nodes) {
     const previous = new Map(this.nodes.map((node) => [node.id, node]));
     const pairs = nodes
       .filter((node) => previous.has(node.id))
       .map((node) => [node, previous.get(node.id)]);
-    if (pairs.length < 2) return nodes;
+    if (pairs.length < 2) return (point) => point;
 
     let best = null;
     for (const mirror of [1, -1]) {
@@ -81,15 +106,18 @@ export class AnchorScene {
 
     const cos = Math.cos(best.angle);
     const sin = Math.sin(best.angle);
-    return nodes.map((node) => {
-      const x = best.mirror * node.x;
-      return {...node, x: x * cos - node.y * sin, y: x * sin + node.y * cos};
-    });
+    return (point) => {
+      const x = best.mirror * point.x;
+      return {...point, x: x * cos - point.y * sin, y: x * sin + point.y * cos};
+    };
   }
 
-  _animateTo(target) {
+  _animateTo(target, targetBeacons) {
     const from = new Map(
-      this.nodes.map((node) => [node.id, {x: node.x, y: node.y, z: node.z}]),
+      [...this.nodes, ...this.beacons].map((node) => [
+        node.id,
+        {x: node.x, y: node.y, z: node.z},
+      ]),
     );
     const started = performance.now();
     cancelAnimationFrame(this._frame);
@@ -97,7 +125,7 @@ export class AnchorScene {
     const tick = (now) => {
       const t = Math.min(1, (now - started) / ANIMATION_MS);
       const eased = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
-      this.nodes = target.map((node) => {
+      const move = (node) => {
         const start = from.get(node.id);
         if (!start) return node;
         return {
@@ -106,7 +134,9 @@ export class AnchorScene {
           y: start.y + (node.y - start.y) * eased,
           z: start.z + (node.z - start.z) * eased,
         };
-      });
+      };
+      this.nodes = target.map(move);
+      this.beacons = targetBeacons.map(move);
       this.draw();
       if (t < 1) this._frame = requestAnimationFrame(tick);
     };
@@ -166,12 +196,12 @@ export class AnchorScene {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
-    const projected = this._project();
+    const camera = this._camera();
     let found = null;
-    for (const point of projected) {
-      if (Math.hypot(point.sx - x, point.sy - y) <= NODE_RADIUS * 2) {
-        found = point.node.id;
-      }
+    for (const node of [...this._visibleBeacons(), ...this.nodes]) {
+      const point = this._projectPoint(camera, node.x, node.y, node.z);
+      const reach = node.beacon ? BEACON_RADIUS * 2.5 : NODE_RADIUS * 2;
+      if (Math.hypot(point.sx - x, point.sy - y) <= reach) found = node.id;
     }
     if (found !== this.hovered) {
       this.hovered = found;
@@ -185,14 +215,16 @@ export class AnchorScene {
     const cy = this.canvas.height / (2 * dpr);
 
     // Fit the whole scene in view regardless of how big the house is.
-    const extent =
+    const reach = (points) =>
       Math.max(
         1,
-        ...this.nodes.flatMap((n) => [
-          Math.abs(n.x),
-          Math.abs(n.y),
-          Math.abs(n.z),
-        ]),
+        ...points.flatMap((n) => [Math.abs(n.x), Math.abs(n.y), Math.abs(n.z)]),
+      );
+    const radios = reach(this.nodes);
+    const extent =
+      Math.min(
+        radios * MAX_BEACON_EXTENT,
+        Math.max(radios, this._visibleBeacons().length ? reach(this.beacons) : 0),
       ) * 1.6;
 
     return {
@@ -219,12 +251,8 @@ export class AnchorScene {
     };
   }
 
-  _project() {
-    const camera = this._camera();
-    return this.nodes.map((node) => ({
-      node,
-      ...this._projectPoint(camera, node.x, node.y, node.z),
-    }));
+  _visibleBeacons() {
+    return this.showBeacons ? this.beacons : [];
   }
 
   draw() {
@@ -277,8 +305,20 @@ export class AnchorScene {
       ctx.fillText(`${edge.distance}m`, midX, midY - 3);
     }
 
-    for (const point of [...projected].sort((a, b) => a.depth - b.depth)) {
+    const everything = [
+      ...this._visibleBeacons().map((node) => ({
+        node,
+        ...this._projectPoint(camera, node.x, node.y, node.z),
+      })),
+      ...projected,
+    ].sort((a, b) => a.depth - b.depth);
+
+    for (const point of everything) {
       const isHovered = this.hovered === point.node.id;
+      if (point.node.beacon) {
+        this._drawBeacon(ctx, camera, point, isHovered, textColor);
+        continue;
+      }
       ctx.beginPath();
       ctx.arc(point.sx, point.sy, NODE_RADIUS, 0, Math.PI * 2);
       ctx.fillStyle = point.node.color;
@@ -292,6 +332,42 @@ export class AnchorScene {
       ctx.textAlign = "center";
       ctx.fillText(point.node.label, point.sx, point.sy - NODE_RADIUS - 8);
     }
+  }
+
+  // A beacon is drawn as a dot inside a ring showing how far it could actually
+  // be. At a real house's noise that ring is metres wide and frequently larger
+  // than the dot's distance from its neighbours, which is the honest picture:
+  // the dot says roughly where, the ring says do not read too much into it.
+  _drawBeacon(ctx, camera, point, isHovered, textColor) {
+    const node = point.node;
+    const halo = Math.min(MAX_HALO_PX, (node.uncertainty || 0) * camera.scale);
+    if (isHovered && halo > BEACON_RADIUS) {
+      ctx.beginPath();
+      ctx.arc(point.sx, point.sy, halo, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,167,38,.13)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,167,38,.5)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    ctx.beginPath();
+    ctx.arc(point.sx, point.sy, BEACON_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = isHovered ? "#ffa726" : "rgba(255,167,38,.65)";
+    ctx.fill();
+
+    // 120 labels at once is noise, so a beacon names itself only on hover.
+    if (!isHovered) return;
+    ctx.fillStyle = textColor;
+    ctx.font = "600 12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(node.label, point.sx, point.sy - BEACON_RADIUS - 8);
+    ctx.font = "11px ui-monospace, monospace";
+    ctx.fillText(
+      `+/-${(node.uncertainty || 0).toFixed(1)}m`,
+      point.sx,
+      point.sy + BEACON_RADIUS + 14,
+    );
   }
 
   _floors() {

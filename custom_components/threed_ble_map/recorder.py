@@ -59,6 +59,7 @@ class SignalRecorder:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
         self._readings: dict[str, dict[str, _Reading]] = {}
+        self._names: dict[str, str] = {}
         self._unsub: Any = None
         self.started: float | None = None
 
@@ -81,6 +82,7 @@ class SignalRecorder:
             self._unsub()
             self._unsub = None
         self._readings.clear()
+        self._names.clear()
         self.started = None
 
     @callback
@@ -97,10 +99,19 @@ class SignalRecorder:
                 continue
 
             track = self._readings.setdefault(source, {})
-            for address, (_device, adv) in paired.items():
+            for address, (device, adv) in paired.items():
                 rssi = getattr(adv, "rssi", None)
                 if rssi is None:
                     continue
+                # Most beacons never advertise a name, and the ones that do only
+                # include it in some adverts, so keep the first one seen rather
+                # than whatever the latest packet happened to carry.
+                if address not in self._names:
+                    name = getattr(adv, "local_name", None) or getattr(
+                        device, "name", None
+                    )
+                    if name and name != address:
+                        self._names[address] = name
                 if (reading := track.get(address)) is None:
                     track[address] = _Reading(rssi=float(rssi), samples=1)
                 else:
@@ -159,6 +170,10 @@ class SignalRecorder:
                 if advertiser is not None:
                     links.setdefault((listener, advertiser), []).append(reading.rssi)
         return links
+
+    def names(self) -> dict[str, str]:
+        """beacon address -> the friendliest name it has ever advertised."""
+        return dict(self._names)
 
     def sample_counts(self, sources: list[str]) -> dict[str, int]:
         """How many beacons each anchor currently has a track for."""

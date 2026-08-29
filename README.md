@@ -4,8 +4,10 @@ A Home Assistant custom integration that adds a sidebar panel for visualising
 Bluetooth Low Energy devices in 3D, using RSSI from every BLE adapter and
 ESPHome Bluetooth proxy that Home Assistant already talks to.
 
-This is the first milestone: the panel lists the adapters and what each one is
-currently hearing. Positioning comes later.
+The panel lists every adapter and what it hears, then solves a relative 3D
+layout: where the radios sit with respect to each other, and where the beacons
+they hear sit among them. No coordinates are entered anywhere -- the geometry is
+derived from RSSI alone, so it works in a house nobody has surveyed.
 
 ## Install
 
@@ -89,6 +91,37 @@ How it works:
 Refinement only replaces the pairwise layout if it actually fits the data
 better; otherwise the pairwise result stands.
 
+### Beacons
+
+Placing the beacons is not a second pass. The refinement step above has to put
+every beacon somewhere in order to use it as a spring, so their positions fall
+out of the same solve that positions the radios -- they were simply discarded
+before. Any beacon heard by three or more radios is drawn on the map and listed
+below it, strongest first.
+
+Three is the fewest that can fix a point in 3D, and it is also a fit with no
+redundancy: three ranges and three unknowns pass through the data exactly and
+say nothing about whether the answer is right. So every beacon carries an
+uncertainty radius, shown as a ring when you hover it and as a column in the
+table. On a real house these run from about 2 m to well over 10 m -- frequently
+wider than the house itself, which is the honest picture rather than a defect.
+The figure is a *lower* bound: it assumes the radios surround the beacon, and
+one sitting outside them is worse still.
+
+Two things follow, and the panel is built around them:
+
+- **Trust the nearest radio, not the coordinates.** That column comes from the
+  strongest reading, a raw measurement that survives any amount of geometry
+  error. "Which room" is reliable; "where in the room" is not.
+- **Read the uncertainty before the position.** A beacon whose radius exceeds
+  its distance to the nearest radio is located to "somewhere in the house", and
+  the table marks it.
+
+This is a property of RSSI, not of the solver. Range error from received signal
+strength is a constant *fraction* of distance set by the shadowing in the
+building, and no amount of extra radios, extra beacons or better mathematics
+reduces it -- only a quieter radio environment or different hardware does.
+
 ### Radios are not assumed to be fixed
 
 Nothing is persisted. Every solve re-reads the live scanner list, so a radio that
@@ -143,9 +176,12 @@ Run the checks with `python3 tests/test_geometry.py`.
 
 ## Roadmap
 
-- Per-device RSSI history across adapters
-- Anchor positions and a solved 3D fix
-- The 3D view itself
+- A room-level presence entity per beacon, which is the part of this that is
+  accurate enough to drive automations
+- Hand-entered coordinates for two or three radios, to pin the map to real
+  units and orientation instead of a relative frame
+- Ordinal (non-metric) MDS, which is invariant to per-radio calibration by
+  construction rather than solving it out
 
 ## Licence
 
@@ -203,3 +239,25 @@ right is part of the job.
 
 Room centres are only good to about +/- 1.5 m, since the hardware sits on a wall
 rather than mid-room. A result better than that is not measurably better.
+
+### Beacons have no yardstick, so they are cross-validated instead
+
+The floor plan locates the radios and nothing else, so it cannot say whether a
+beacon is in the right place. `validation/beacon_cv.py` answers that without any
+ground truth at all: hide one radio's reading of a beacon, fit the beacon from
+the radios that remain, and see how well the hidden reading is predicted. A
+position that generalises to a radio it was not fitted against means something.
+
+```bash
+python3 validation/beacon_cv.py raw.json
+```
+
+It is scored against the answer available for free -- the beacon parked at the
+centroid of the radios hearing it. On this house the solve beats that null model
+by 33-47%, so the positions do carry information. The held-out error is still
+around 8 dB, which by the same bound the rest of this integration is built
+around is a range error of roughly 70% of the distance. Both things are true at
+once: the dots are real, and they are coarse.
+
+Because it needs no ground truth, this one runs in any house -- which matters,
+since the shipped integration has no floor plan either.

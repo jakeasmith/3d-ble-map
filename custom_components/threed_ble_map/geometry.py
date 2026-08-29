@@ -109,13 +109,16 @@ def solve_layout(
             refined = corrected
         coords = refined["positions"]
 
-    coords = _orient_by_level(anchors, coords, levels or {})
+    transform = _orientation(anchors, coords, levels or {})
+    coords = _apply_orientation(transform, coords)
+    beacons = _oriented_beacons(refined, transform)
 
     return {
         "positions": {
             anchor: {"x": round(p[0], 2), "y": round(p[1], 2), "z": round(p[2], 2)}
             for anchor, p in zip(anchors, coords)
         },
+        "beacons": beacons,
         "pairs": pairs,
         "stress": stress,
         "gains": refined["gains"] if refined else {},
@@ -129,10 +132,28 @@ def solve_layout(
     }
 
 
+def _oriented_beacons(
+    refined: dict[str, Any] | None,
+    transform: tuple[list[float], list[list[float]] | None],
+) -> list[dict[str, Any]]:
+    """Move the solved beacons into the same frame as the radios."""
+    if not refined:
+        return []
+    reported = refined.get("beacons") or []
+    moved = _apply_orientation(
+        transform, [[b["x"], b["y"], b["z"]] for b in reported]
+    )
+    return [
+        {**beacon, "x": round(p[0], 2), "y": round(p[1], 2), "z": round(p[2], 2)}
+        for beacon, p in zip(reported, moved)
+    ]
+
+
 def _empty(error: str, pairs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """A result carrying the same keys as a solved one, so callers need no guards."""
     return {
         "positions": {},
+        "beacons": [],
         "pairs": pairs or [],
         "stress": None,
         "gains": {},
@@ -341,23 +362,26 @@ def _jacobi_eigen(
     return values, vectors
 
 
-def _orient_by_level(
+def _orientation(
     anchors: Sequence[str], coords: list[list[float]], levels: dict[str, float]
-) -> list[list[float]]:
-    """Rotate so the axis separating building floors points up.
+) -> tuple[list[float], list[list[float]] | None]:
+    """Pick a rigid motion that puts the building's floors the right way up.
 
     MDS returns an arbitrary rotation. Home Assistant knows which floor each
-    anchor is on, so use that to pick one -- it does not change the geometry,
-    only which way up it is drawn.
+    anchor is on, so use that to choose one. Returned as a transform rather than
+    applied in place because beacons have to move with the radios: rotating the
+    two sets independently would tear the solution apart.
     """
-    coords = _centre(coords)
+    centroid = _centroid(coords)
+    centred = [[p[axis] - centroid[axis] for axis in range(3)] for p in coords]
+
     grouped: dict[float, list[list[float]]] = {}
-    for anchor, position in zip(anchors, coords):
+    for anchor, position in zip(anchors, centred):
         if (level := levels.get(anchor)) is not None:
             grouped.setdefault(level, []).append(position)
 
     if len(grouped) < 2:
-        return coords
+        return centroid, None
 
     ordered = sorted(grouped)
     lower = _centroid(grouped[ordered[0]])
@@ -365,20 +389,22 @@ def _orient_by_level(
     up = [upper[axis] - lower[axis] for axis in range(3)]
 
     if (norm := math.sqrt(sum(value * value for value in up))) < 1e-9:
-        return coords
+        return centroid, None
     up = [value / norm for value in up]
 
     right = _orthonormal_to(up)
-    forward = _cross(up, right)
-    return [
-        [_dot(position, right), _dot(position, forward), _dot(position, up)]
-        for position in coords
-    ]
+    return centroid, [right, _cross(up, right), up]
 
 
-def _centre(coords: list[list[float]]) -> list[list[float]]:
-    centroid = _centroid(coords)
-    return [[p[axis] - centroid[axis] for axis in range(3)] for p in coords]
+def _apply_orientation(
+    transform: tuple[list[float], list[list[float]] | None],
+    points: list[list[float]],
+) -> list[list[float]]:
+    centroid, basis = transform
+    centred = [[p[axis] - centroid[axis] for axis in range(3)] for p in points]
+    if basis is None:
+        return centred
+    return [[_dot(position, axis) for axis in basis] for position in centred]
 
 
 def _centroid(points: list[list[float]]) -> list[float]:

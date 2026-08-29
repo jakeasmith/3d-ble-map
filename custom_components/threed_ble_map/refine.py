@@ -25,7 +25,7 @@ non-linear and get the SMACOF sweeps. The two alternate.
 Two degeneracies are fixed explicitly: adding a constant to every gain is
 indistinguishable from scaling every distance, so gains are held to zero mean;
 and the whole solution is free to rotate, so orientation is applied afterwards by
-geometry._orient_by_level.
+geometry._orientation.
 """
 
 from __future__ import annotations
@@ -188,7 +188,9 @@ def refine_layout(
         links,
     )
 
-    best: tuple[float, list[list[float]], list[float]] | None = None
+    best: tuple[
+        float, list[list[float]], list[float], float, list[list[float]]
+    ] | None = None
     for attempt in range(RESTARTS):
         rng = random.Random(attempt)
         points = [
@@ -220,9 +222,15 @@ def refine_layout(
             points, beacon_points, gains, readings, links, radio_levels, penalty
         )
         if best is None or residual < best[0]:
-            best = (residual, [p[:] for p in points], gains[:], penalty)
+            best = (
+                residual,
+                [p[:] for p in points],
+                gains[:],
+                penalty,
+                [b[:] for b in beacon_points],
+            )
 
-    current, points, gains, penalty = best
+    current, points, gains, penalty, beacon_points = best
 
     if current >= baseline:
         # Refinement is an optimisation, not an article of faith. If it did not
@@ -231,6 +239,10 @@ def refine_layout(
 
     return {
         "positions": [list(point) for point in points],
+        "beacons": _beacon_report(
+            beacons, beacon_points, points, readings, gains,
+            current, radio_levels, penalty,
+        ),
         "gains": {radio: round(gains[i], 1) for i, radio in enumerate(radios)},
         "residual_db": round(current, 2),
         "seed_residual_db": round(baseline, 2),
@@ -498,6 +510,85 @@ def _median(values: list[float]) -> float:
     if len(ordered) % 2:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _beacon_report(
+    beacons: Sequence[str],
+    beacon_points: list[list[float]],
+    points: list[list[float]],
+    readings: list[tuple[int, int, float]],
+    gains: list[float],
+    sigma_db: float,
+    radio_levels: list[float | None],
+    floor_penalty: float,
+) -> list[dict[str, Any]]:
+    """Describe each solved beacon, with how far it can be trusted.
+
+    The position itself is a by-product: the joint solve has to place beacons in
+    order to use them, and until now it threw them away. What it does not come
+    with is any statement of confidence, and beacons need one far more than
+    radios do. A radio is pinned by every beacon in the house -- sixty-odd
+    observations -- whereas a beacon is pinned by however many radios happen to
+    hear it, often exactly three. Three ranges and three unknowns is a fit with
+    no redundancy at all: it will pass through the data exactly and tell you
+    nothing about whether it is right.
+
+    So each beacon carries a radius. Patwari's bound gives the range error as a
+    constant *fraction* of distance, sigma_d/d = (ln10/10)(sigma_dB/n), and
+    trilaterating k of them recovers at best a sqrt(3/k) improvement over one.
+    Hence radius ~ fraction * mean_distance * sqrt(3/k).
+
+    Two honest caveats. The bound assumes favourable geometry: a beacon outside
+    the hull of the radios that hear it has a dilution of precision above one,
+    sometimes far above, and this does not compute that. And sigma comes from
+    the global fit rather than the beacon's own residual, because three samples
+    cannot estimate a standard deviation. The radius is therefore a lower bound
+    on the error -- the beacon is at least this uncertain.
+    """
+    by_beacon: dict[int, list[tuple[int, float]]] = {}
+    for radio, beacon, observed in readings:
+        by_beacon.setdefault(beacon, []).append((radio, observed))
+
+    levels = _beacon_levels(beacon_points, points, radio_levels)
+    fraction = (math.log(10) / (10 * PATH_LOSS_EXPONENT)) * sigma_db
+
+    report = []
+    for b, address in enumerate(beacons):
+        heard = by_beacon.get(b, [])
+        if not heard:
+            continue
+        point = beacon_points[b]
+
+        distances = []
+        squared = 0.0
+        for radio, observed in heard:
+            distance = max(MIN_SEPARATION_M, math.dist(points[radio], point))
+            distances.append(distance)
+            predicted = (
+                TX_POWER_AT_1M
+                + gains[radio]
+                - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+                - floor_penalty * _floors_apart(radio_levels[radio], levels[b])
+            )
+            squared += (observed - predicted) ** 2
+
+        k = len(heard)
+        mean_distance = sum(distances) / k
+        report.append(
+            {
+                "address": address,
+                "x": round(point[0], 2),
+                "y": round(point[1], 2),
+                "z": round(point[2], 2),
+                "radios": k,
+                "nearest_m": round(min(distances), 2),
+                "residual_db": round(math.sqrt(squared / k), 2),
+                "uncertainty_m": round(
+                    fraction * mean_distance * math.sqrt(3.0 / k), 2
+                ),
+            }
+        )
+    return report
 
 
 def _shared_beacons(

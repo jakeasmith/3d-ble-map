@@ -17,6 +17,12 @@ const REFRESH_MS = 5000;
 const SIGNAL_LIMIT = 20;
 const BASE_PATH = "/threed-ble-map";
 
+const BEACON_ROWS = 25;
+
+// Three ranges is the fewest that fix a point in 3D, and it is also the fewest
+// the solver will place. Mirrors refine.MIN_RADIOS_PER_BEACON.
+const MIN_BEACON_RADIOS = 3;
+
 const FLOOR_COLORS = ["#42a5f5", "#66bb6a", "#ab47bc", "#ffa726"];
 const UNKNOWN_FLOOR_COLOR = "#78909c";
 
@@ -34,6 +40,7 @@ class ThreeDBleMapPanel extends HTMLElement {
     this._scene = null;
     this._sceneLoading = false;
     this._showEdges = true;
+    this._showBeacons = true;
     this._rendered = false;
   }
 
@@ -252,6 +259,7 @@ class ThreeDBleMapPanel extends HTMLElement {
         <div class="card canvas-card"><canvas id="scene"></canvas></div>
         <div class="controls">
           <label><input type="checkbox" id="show-edges" /> Show links between radios</label>
+          <label><input type="checkbox" id="show-beacons" /> Show beacons</label>
         </div>
         <div class="hint">Drag to orbit · scroll to zoom · solid lines are direct
           radio-to-radio links, dashed lines are inferred from shared beacons.
@@ -262,12 +270,22 @@ class ThreeDBleMapPanel extends HTMLElement {
           otherwise be placed too close to everything it hears.</div>
         <div class="card" id="radios"></div>
         <h2>Pair distances</h2>
-        <div class="card" id="pairs"></div>`;
+        <div class="card" id="pairs"></div>
+        <h2>Beacons</h2>
+        <div class="sub">${BEACON_BLURB}</div>
+        <div class="card" id="beacons"></div>`;
       const toggle = this.shadowRoot.getElementById("show-edges");
       toggle.checked = this._showEdges;
       toggle.addEventListener("change", () => {
         this._showEdges = toggle.checked;
         if (this._scene) this._scene.setShowEdges(this._showEdges);
+      });
+
+      const beaconToggle = this.shadowRoot.getElementById("show-beacons");
+      beaconToggle.checked = this._showBeacons;
+      beaconToggle.addEventListener("change", () => {
+        this._showBeacons = beaconToggle.checked;
+        if (this._scene) this._scene.setShowBeacons(this._showBeacons);
       });
 
       this._sceneLoading = true;
@@ -277,6 +295,7 @@ class ThreeDBleMapPanel extends HTMLElement {
         if (!canvas) return;
         this._scene = new AnchorScene(canvas);
         this._scene.setShowEdges(this._showEdges);
+        this._scene.setShowBeacons(this._showBeacons);
         this._scene.resize();
         this._renderView();
       });
@@ -293,9 +312,10 @@ class ThreeDBleMapPanel extends HTMLElement {
       map,
       colors,
     );
+    this.shadowRoot.getElementById("beacons").innerHTML = this._beaconTable(map);
 
     if (map.error || !this._scene) {
-      if (this._scene) this._scene.setData([], []);
+      if (this._scene) this._scene.setData([], [], []);
       return;
     }
 
@@ -316,7 +336,56 @@ class ThreeDBleMapPanel extends HTMLElement {
       inferred: pair.method === "inferred",
     }));
 
-    this._scene.setData(nodes, edges);
+    const beacons = (map.beacons || []).map((beacon) => ({
+      id: `beacon:${beacon.address}`,
+      label: beaconLabel(beacon),
+      beacon: true,
+      uncertainty: beacon.uncertainty_m,
+      x: beacon.x,
+      y: beacon.y,
+      z: beacon.z,
+    }));
+
+    this._scene.setData(nodes, edges, beacons);
+  }
+
+  _beaconTable(map) {
+    const beacons = map.beacons || [];
+    if (!beacons.length) {
+      return `<div class="msg">No beacon is heard by ${MIN_BEACON_RADIOS} radios
+        yet, which is the fewest that can fix a point in 3D.</div>`;
+    }
+    const rows = beacons
+      .slice(0, BEACON_ROWS)
+      .map((beacon) => {
+        // The ring on the map is the same number. A beacon whose uncertainty
+        // exceeds its distance to the nearest radio is, in plain terms, only
+        // located to "somewhere in the house".
+        const vague = beacon.uncertainty_m >= beacon.nearest_m;
+        return `
+      <tr>
+        <td>${escapeHtml(beaconLabel(beacon))}</td>
+        <td class="mono">${escapeHtml(beacon.address)}</td>
+        <td>${beacon.nearest_anchor ? escapeHtml(beacon.nearest_anchor) : dash()}</td>
+        <td>${beacon.nearest_area ? escapeHtml(beacon.nearest_area) : dash()}</td>
+        <td class="num">${beacon.radios}</td>
+        <td class="num">${beacon.rssi === null ? dash() : `${beacon.rssi} dBm`}</td>
+        <td class="num">
+          <span class="pill ${vague ? "warn" : "ok"}">±${beacon.uncertainty_m} m</span>
+        </td>
+      </tr>`;
+      })
+      .join("");
+    const more =
+      beacons.length > BEACON_ROWS
+        ? `<div class="hint" style="padding:0 16px 14px">
+             Showing the ${BEACON_ROWS} strongest of ${beacons.length} placed.</div>`
+        : "";
+    return `<table><thead><tr>
+        <th>Beacon</th><th>Address</th><th>Nearest radio</th><th>Area</th>
+        <th class="num">Radios</th><th class="num">Strongest</th>
+        <th class="num">Uncertainty</th>
+      </tr></thead><tbody>${rows}</tbody></table>${more}`;
   }
 
   _mapStats(map) {
@@ -335,6 +404,10 @@ class ThreeDBleMapPanel extends HTMLElement {
         map.residual_db === null ? "—" : `${map.residual_db} dB`,
       ],
       ["Calibrated", map.refined ? `${map.beacons_used} beacons` : "not enough data"],
+      [
+        "Beacons placed",
+        `${(map.beacons || []).length} of ${map.tracked_beacons ?? 0}`,
+      ],
     ];
     const stats = cards
       .map(
@@ -406,6 +479,15 @@ const MAP_BLURB =
   "the origin is not. Note that the vertical axis is stretched — a floor " +
   "between two radios eats signal that the path-loss model reads as distance, " +
   "so storeys come out further apart than they are.";
+
+const BEACON_BLURB =
+  "Every beacon heard by at least three radios, placed by the same solve that " +
+  "positions the radios themselves. Read the uncertainty column before reading " +
+  "the position: at the noise a real house produces, a beacon\u2019s range " +
+  "error is a large fraction of its distance, and the figure is a lower bound " +
+  "\u2014 it assumes the radios surround the beacon, which they often do not. " +
+  "The nearest radio is a direct measurement and stays right when the " +
+  "coordinates are shaky.";
 
 const STYLES = `
   :host {
@@ -495,6 +577,12 @@ function formatHeardBy(entry) {
 
 function pill(value, yes, no) {
   return `<span class="pill ${value ? "ok" : "bad"}">${value ? yes : no}</span>`;
+}
+
+function beaconLabel(beacon) {
+  // Most beacons never advertise a name. The last three octets are enough to
+  // tell them apart and short enough to sit under a dot on the map.
+  return beacon.name || beacon.address.split(":").slice(-3).join(":");
 }
 
 function dash() {

@@ -320,7 +320,8 @@ async def ws_anchor_map(
         result = {"positions": {}, "pairs": [], "stress": None, "error": None}
     else:
         result = await _async_cached_solve(
-            hass, recorder, ordered, levels
+            hass, recorder, ordered, levels,
+            {anchor["source"]: anchor for anchor in anchors},
         )
 
     connection.send_result(
@@ -340,6 +341,7 @@ async def _async_cached_solve(
     recorder: Any,
     ordered: list[str],
     levels: dict[str, float],
+    anchors: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Solve the layout off the event loop, reusing a recent result.
 
@@ -367,11 +369,52 @@ async def _async_cached_solve(
     result = await hass.async_add_executor_job(
         partial(geometry.solve_layout, ordered, direct, observations, levels)
     )
+    result["beacons"] = _describe_beacons(
+        result.get("beacons") or [], observations, recorder.names(), anchors
+    )
     result["rejected_beacons"] = rejected
     result["tracked_beacons"] = tracked
 
     cache.update({"result": result, "key": key, "at": now})
     return result
+
+
+def _describe_beacons(
+    beacons: list[dict[str, Any]],
+    observations: dict[str, dict[str, float]],
+    names: dict[str, str],
+    anchors: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach a name and a nearest radio to each solved beacon.
+
+    The nearest radio is taken from the strongest reading, not from the solved
+    coordinates. That is deliberate: "which radio hears this loudest" is a raw
+    measurement that survives any amount of geometry error, so it stays right
+    even where the 3D position is barely better than a guess. It is the field to
+    trust when the uncertainty radius is large.
+    """
+    described = []
+    for beacon in beacons:
+        address = beacon["address"]
+        heard = {
+            source: observations[source][address]
+            for source in observations
+            if address in observations[source]
+        }
+        loudest = max(heard, key=heard.get) if heard else None
+        anchor = anchors.get(loudest) if loudest else None
+        described.append(
+            {
+                **beacon,
+                "name": names.get(address),
+                "nearest_anchor": anchor["label"] if anchor else None,
+                "nearest_area": anchor["area"] if anchor else None,
+                "rssi": round(heard[loudest]) if loudest else None,
+            }
+        )
+    # Strongest first: the beacons a user can actually place are at the top.
+    described.sort(key=lambda beacon: -(beacon["rssi"] or -127))
+    return described
 
 
 @websocket_api.require_admin

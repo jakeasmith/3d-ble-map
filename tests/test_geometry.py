@@ -79,6 +79,8 @@ def simulate(
 
     `gains` simulates uncalibrated radios: each board reading a few dB off the
     others, which is the normal case and not something to be assumed away.
+
+    Also returns where each beacon really was, so beacon recovery can be scored.
     """
     penalties = penalties or {}
     gains = gains or {anchor: 0.0 for anchor in TRUTH}
@@ -108,6 +110,7 @@ def simulate(
                 + gains[advertiser]
             ]
 
+    beacons: dict[str, tuple[float, float, float]] = {}
     observations = {anchor: {} for anchor in TRUTH}
     for index in range(BEACON_COUNT):
         beacon = (
@@ -127,8 +130,9 @@ def simulate(
             )
             if reading > -100:  # radio sensitivity floor
                 observations[anchor][f"b{index}"] = reading
+        beacons[f"b{index}"] = beacon
 
-    return direct, observations
+    return direct, observations, beacons
 
 
 def shape_error(positions: dict[str, dict[str, float]]) -> float:
@@ -159,7 +163,7 @@ def check(name: str, condition: bool, detail: str) -> bool:
 
 def test_recovers_shape() -> bool:
     random.seed(7)
-    direct, observations = simulate()
+    direct, observations, _beacons = simulate()
     result = geometry.solve_layout(list(TRUTH), direct, observations, LEVELS)
 
     ok = check("no error", result["error"] is None, str(result["error"]))
@@ -187,7 +191,7 @@ def test_rejects_attenuated_link() -> bool:
     reading between two anchors became a 26m estimate and broke the embedding.
     """
     random.seed(11)
-    direct, observations = simulate(penalties={("mainbed", "office"): 22.0})
+    direct, observations, _beacons = simulate(penalties={("mainbed", "office"): 22.0})
     result = geometry.solve_layout(list(TRUTH), direct, observations, LEVELS)
 
     pair = next(
@@ -225,7 +229,7 @@ def test_recovers_uncalibrated_gains() -> bool:
         "stretch": -2.0,
     }
     random.seed(5)
-    direct, observations = simulate(gains=gains)
+    direct, observations, _beacons = simulate(gains=gains)
     result = geometry.solve_layout(list(TRUTH), direct, observations, LEVELS)
 
     ok = check("refinement ran", result["refined"], f"residual={result['residual_db']} dB")
@@ -248,6 +252,121 @@ def test_recovers_uncalibrated_gains() -> bool:
         "shape survives uncalibrated radios",
         error < 2.0,
         f"{error:.2f}m RMS",
+    )
+    return ok
+
+
+# What the real house measures, from the fit residual on two live captures.
+# The other tests in this file predate that measurement and run at NOISE_DB;
+# beacon recovery is checked here at the real figure as well, because it is the
+# regime where the answer changes qualitatively rather than just getting worse.
+REALISTIC_NOISE_DB = 7.85
+
+
+def _score_beacons(noise_db: float, seed: int = 11) -> dict[str, float]:
+    """Recover beacons at a given noise level and score them against truth.
+
+    Scored on each beacon's distance to each radio rather than its coordinates,
+    which sidesteps the rotation and reflection MDS leaves arbitrary -- the same
+    trick shape_error uses.
+
+    Scored against a null model too: a beacon parked at the centroid of the
+    radios that hear it. That is the layout you get for free, without solving
+    anything, so the ratio between the two is the only number that says whether
+    the solve is carrying information.
+    """
+    global NOISE_DB
+    previous = NOISE_DB
+    NOISE_DB = noise_db
+    try:
+        random.seed(seed)
+        direct, observations, truth = simulate()
+        result = geometry.solve_layout(list(TRUTH), direct, observations, LEVELS)
+    finally:
+        NOISE_DB = previous
+
+    positions = result["positions"]
+    anchors = list(TRUTH)
+    errors, null_errors, within = [], [], 0
+
+    for beacon in result["beacons"]:
+        real = truth[beacon["address"]]
+        heard = [a for a in anchors if beacon["address"] in observations[a]]
+        centroid = [
+            sum(positions[a][axis] for a in heard) / len(heard) for axis in "xyz"
+        ]
+        point = [beacon[axis] for axis in "xyz"]
+
+        residual = null_residual = 0.0
+        for anchor in anchors:
+            true_range = math.dist(real, TRUTH[anchor])
+            seat = [positions[anchor][axis] for axis in "xyz"]
+            residual += (true_range - math.dist(point, seat)) ** 2
+            null_residual += (true_range - math.dist(centroid, seat)) ** 2
+
+        error = math.sqrt(residual / len(anchors))
+        errors.append(error)
+        null_errors.append(math.sqrt(null_residual / len(anchors)))
+        # The reported radius ignores dilution of precision, so it is a lower
+        # bound on the error and is checked as a floor, not a promise.
+        if error <= 2 * beacon["uncertainty_m"]:
+            within += 1
+
+    median = sorted(errors)[len(errors) // 2]
+    null_median = sorted(null_errors)[len(null_errors) // 2]
+    return {
+        "placed": len(result["beacons"]),
+        "median": median,
+        "null_median": null_median,
+        "ratio": median / null_median,
+        "covered": within / len(errors),
+        "residual_db": result["residual_db"],
+        "fewest_radios": min(b["radios"] for b in result["beacons"]),
+    }
+
+
+def test_places_beacons() -> bool:
+    """Beacon positions must beat a free guess, and be honest about their error."""
+    clean = _score_beacons(NOISE_DB)
+    real = _score_beacons(REALISTIC_NOISE_DB)
+
+    ok = check(
+        "beacons are returned",
+        clean["placed"] > BEACON_COUNT // 2,
+        f"{clean['placed']} of {BEACON_COUNT} placed",
+    )
+    ok &= check(
+        "every placed beacon had at least 3 radios",
+        clean["fewest_radios"] >= refine.MIN_RADIOS_PER_BEACON,
+        f"fewest radios on any beacon: {clean['fewest_radios']}",
+    )
+    ok &= check(
+        f"at {NOISE_DB} dB, beacons clearly beat the centroid guess",
+        clean["ratio"] < 0.6,
+        f"{clean['median']:.2f}m vs {clean['null_median']:.2f}m null "
+        f"({clean['ratio']:.2f}x)",
+    )
+
+    # The house is not a 2 dB environment. At its real noise the solve still
+    # wins, but only just, and that margin is the honest description of what a
+    # beacon dot on the map is worth. If this ever tightens below ~0.6 something
+    # has genuinely improved; if it reaches 1.0 the dots are decoration and
+    # should stop being drawn.
+    ok &= check(
+        f"at a realistic {REALISTIC_NOISE_DB} dB, beacons still beat it",
+        real["ratio"] < 0.95,
+        f"{real['median']:.2f}m vs {real['null_median']:.2f}m null "
+        f"({real['ratio']:.2f}x) -- a thin margin, by design of physics",
+    )
+    ok &= check(
+        "realistic noise reproduces the house's fit residual",
+        4.5 < real["residual_db"] < 7.0,
+        f"{real['residual_db']} dB simulated vs 5.75-5.99 dB measured",
+    )
+    ok &= check(
+        "reported uncertainty brackets the real error at both noise levels",
+        0.5 < clean["covered"] <= 1.0 and 0.5 < real["covered"] <= 1.0,
+        f"{clean['covered']:.0%} and {real['covered']:.0%} inside 2x the radius",
     )
     return ok
 
@@ -282,6 +401,7 @@ def main() -> int:
         test_recovers_shape,
         test_rejects_attenuated_link,
         test_recovers_uncalibrated_gains,
+        test_places_beacons,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")
