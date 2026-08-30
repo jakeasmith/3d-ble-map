@@ -53,12 +53,22 @@ MIN_RADIOS_PER_BEACON = 3
 
 # Radios on one storey share a floor, so their heights should agree. Home
 # Assistant knows which floor each radio is on, and that is a much stronger fact
-# than anything RSSI can say about the vertical axis -- a floor between two
-# radios eats signal that the path-loss model books as distance, which is what
-# stretches the layout. This weights the "same floor, same height" spring
-# against a radio's observations; 1.0 makes it worth as much as everything else
-# that radio hears put together.
-FLOOR_COHESION = 0.8
+# than anything RSSI can say about the vertical axis. This weights the "same
+# floor, same height" spring against a radio's observations; 1.0 makes it worth
+# as much as everything else that radio hears put together.
+#
+# This is the soft half of the vertical model. CEILING_HEIGHT_M below is the
+# hard half: the spring shapes where radios sit inside their storey, the clamp
+# forbids them from leaving it. Chosen at 0.5 by a 12-seed sweep at realistic
+# noise -- it beat every other value on both mean shape error (2.11 m) and, more
+# tellingly, on the worst case (2.79 m against 3.83 m at 0.8), so it is mainly
+# buying protection from bad solves rather than a better typical one.
+#
+# Note what this costs: within-floor height detail is flattened to a few
+# centimetres against a real 1.6 m spread. That detail is not recoverable from
+# RSSI anyway -- desk height versus shelf height is far below the noise -- and
+# giving it up buys a materially better horizontal layout.
+FLOOR_COHESION = 0.5
 
 # Residuals beyond this many dB are treated as outliers -- a wall, a reflection,
 # a beacon that moved mid-window -- and are downweighted rather than chased.
@@ -116,6 +126,34 @@ RESTART_JITTER = 0.4
 # centres, which are only good to about +/- 1.5 m.
 FLOOR_PENALTY_DB = 3.0
 
+# Two facts about how houses are built, used as hard bounds on the vertical axis.
+# They are generic American construction, not facts about any particular home, so
+# they cost nothing in portability -- unlike a floor plan, which would make the
+# solver accurate in one house and useless everywhere else.
+#
+# Both are applied as dead-zone projections: they do nothing until the layout
+# leaves the range a building could actually occupy, and then move it only as far
+# as the nearest edge. Nothing is asserted beyond "that answer is impossible".
+#
+# CEILING_HEIGHT_M caps how far apart two radios on one storey can sit
+# vertically. 8 ft is the traditional US ceiling and the floor-to-ceiling
+# distance is the absolute limit -- in practice these sit on desks and shelves
+# and differ by well under half of it, so this only ever removes nonsense.
+CEILING_HEIGHT_M = 2.4
+
+# STOREY_PITCH_M is floor-to-floor: ceiling height plus the floor assembly
+# (joists, subfloor, finish, ceiling drywall, about a foot). Two independent
+# derivations agree. By component build-up: 8 ft ceiling + 2x10 joists = 2.73 m,
+# 9 ft + deep I-joists = 3.11 m. By stair geometry -- a flight's total rise *is*
+# the floor-to-floor height, no assumptions needed -- 14 to 15 risers at 7 to
+# 7.75 in (the IRC cap) gives 2.7 to 2.95 m.
+#
+# The tolerance is deliberately wide. Real houses vary by about this much, and
+# pinning the pitch exactly would assert more than the construction data
+# supports. Treat 2.9 m as a working centre, not a measured constant.
+STOREY_PITCH_M = 2.9
+STOREY_PITCH_TOLERANCE_M = 0.4
+
 
 def shadowing_bias(shadowing_db: float) -> float:
     """How much the naive path-loss inversion overestimates distance.
@@ -169,6 +207,7 @@ def refine_layout(
 
     levels = levels or {}
     floor_groups = _floor_groups(radios, levels)
+    storeys = _storeys(radios, levels)
     radio_levels = [levels.get(radio) for radio in radios]
     bias = shadowing_bias(shadowing_db)
     scale = _scene_scale(seed_points)
@@ -202,6 +241,7 @@ def refine_layout(
             for point in seed_points
         ]
         gains = [0.0] * len(radios)
+        _constrain_storeys(points, storeys)
         beacon_points = _seed_beacons(radios, observations, beacons, points, rng)
         penalty = FLOOR_PENALTY_DB if any(
             level is not None for level in radio_levels
@@ -217,6 +257,8 @@ def refine_layout(
                     points, beacon_points, gains, readings, links,
                     floor_groups, bias, radio_levels, penalty,
                 )
+                _constrain_storeys(points, storeys)
+                _constrain_beacons(beacon_points, points, storeys)
 
         residual = _rms_residual(
             points, beacon_points, gains, readings, links, radio_levels, penalty
@@ -307,6 +349,113 @@ def _scene_scale(points: list[list[float]]) -> float:
     return max(1.0, max(spans))
 
 
+def _storeys(
+    radios: Sequence[str], levels: dict[str, float]
+) -> list[tuple[float, list[int]]]:
+    """(level, radio indices) for every storey, lowest first.
+
+    Unlike _floor_groups this keeps storeys holding a single radio, because one
+    radio still has to sit a storey's height above the floor below it.
+    """
+    by_level: dict[float, list[int]] = {}
+    for i, radio in enumerate(radios):
+        if (level := levels.get(radio)) is not None:
+            by_level.setdefault(level, []).append(i)
+    return sorted(by_level.items())
+
+
+def _constrain_storeys(
+    points: list[list[float]], storeys: list[tuple[float, list[int]]]
+) -> None:
+    """Force the vertical axis into a shape a building could have.
+
+    RSSI says almost nothing reliable about height: a floor between two radios
+    eats signal that the path-loss model books as distance, so the vertical axis
+    inflates and there is no term anywhere that knows how tall a storey is. Left
+    alone this house solved to radios 6.3 m apart *on one floor* and storeys
+    7.4 m apart -- both about 2.5x impossible.
+
+    Two projections fix that, applied after every sweep:
+
+    1. Radios on one storey are pulled inside a ceiling's height of their
+       median. The median rather than the mean because the failure case is two
+       outliers dragging a group, which is exactly what the mean follows.
+    2. Adjacent storeys are held a storey's pitch apart, within tolerance.
+
+    Only the vertical coordinate is touched. The horizontal spread that a link
+    needs is then recovered by the next sweep on its own: a spring whose rest
+    length is unchanged but whose vertical component just shrank must grow
+    horizontally, since h = sqrt(d^2 - dz^2). Doing that redirection by hand
+    would risk overshoot and lose the monotone convergence that makes projected
+    majorization safe.
+    """
+    if not storeys:
+        return
+
+    half = CEILING_HEIGHT_M / 2
+    for _level, group in storeys:
+        centre = _median([points[i][2] for i in group])
+        for i in group:
+            points[i][2] = min(centre + half, max(centre - half, points[i][2]))
+
+    # Walk upwards, carrying the shift already applied to the storeys below so
+    # correcting one gap cannot silently break the one above it.
+    carried = 0.0
+    for index in range(1, len(storeys)):
+        lower_level, lower = storeys[index - 1]
+        upper_level, upper = storeys[index]
+        for i in upper:
+            points[i][2] += carried
+
+        gap = _median([points[i][2] for i in upper]) - _median(
+            [points[i][2] for i in lower]
+        )
+        # Levels need not be consecutive, so scale the target by how many
+        # storeys actually separate them.
+        between = max(1.0, abs(upper_level - lower_level))
+        lowest = (STOREY_PITCH_M - STOREY_PITCH_TOLERANCE_M) * between
+        highest = (STOREY_PITCH_M + STOREY_PITCH_TOLERANCE_M) * between
+
+        correction = 0.0
+        if gap > highest:
+            correction = highest - gap
+        elif gap < lowest:
+            correction = lowest - gap
+        if correction:
+            for i in upper:
+                points[i][2] += correction
+            carried += correction
+
+
+def _constrain_beacons(
+    beacon_points: list[list[float]],
+    points: list[list[float]],
+    storeys: list[tuple[float, list[int]]],
+) -> None:
+    """Hold beacons inside the building's vertical extent.
+
+    Constraining only the radios moves the problem rather than solving it. The
+    path-loss model still books cross-floor attenuation as distance, and once
+    the radios are pinned that excess goes somewhere else -- into the beacons,
+    which were landing 8 m below the ground floor and 10 m above the roof.
+    Measured effect: flattening the radios alone made beacon positions *worse*
+    than parking each beacon at the centroid of the radios hearing it.
+
+    A beacon heard by three radios is inside the house, so it lies between the
+    lowest storey's floor and the highest storey's ceiling. Radios sit somewhere
+    within their own storey, so their median height is half a ceiling below that
+    storey's ceiling and half above its floor, which sets the envelope.
+    """
+    if not storeys:
+        return
+    half = CEILING_HEIGHT_M / 2
+    floors = [_median([points[i][2] for i in group]) for _level, group in storeys]
+    lowest = min(floors) - half
+    highest = max(floors) + half
+    for beacon in beacon_points:
+        beacon[2] = min(highest, max(lowest, beacon[2]))
+
+
 def _floor_groups(
     radios: Sequence[str], levels: dict[str, float]
 ) -> list[list[int]]:
@@ -377,8 +526,8 @@ def _majorize(
         _pull(points[advertiser], points[listener], rest, targets[advertiser], weights, advertiser)
 
     # Radios on one storey are at the same height. Pull each towards its floor's
-    # mean, as a spring alongside the observations rather than a hard clamp, so
-    # a genuine height difference can still show through.
+    # mean as a spring alongside the observations. _constrain_storeys applies the
+    # hard bound after the sweep; this only shapes the distribution inside it.
     for group in floor_groups:
         mean_z = sum(points[i][2] for i in group) / len(group)
         for i in group:

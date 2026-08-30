@@ -85,8 +85,17 @@ How it works:
    majorization (SMACOF), with each radio's gain offset solved alongside the
    positions. Gains are held to zero mean, since a constant added to all of them
    is indistinguishable from scaling every distance.
-4. **Orientation.** MDS returns an arbitrary rotation, so the result is rotated
-   to put the axis separating your Home Assistant floors vertical.
+4. **Orientation, before the refinement rather than after.** MDS returns an
+   arbitrary rotation, so the layout is first rotated to put the axis separating
+   your Home Assistant floors vertical. This has to happen *before* step 3,
+   because step 3 constrains that axis against how tall a storey is, which is
+   only meaningful once it points up.
+5. **Architectural bounds on height.** RSSI says very little that is trustworthy
+   about the vertical axis, so two facts about how houses are built are imposed
+   on it after every SMACOF sweep: radios on one storey sit within a ceiling's
+   height (2.4 m) of each other, and adjacent storeys sit a floor-to-floor pitch
+   apart (2.9 m, plus or minus 0.4). Beacons are held inside the same building
+   envelope. See *The vertical axis* below.
 
 Refinement only replaces the pairwise layout if it actually fits the data
 better; otherwise the pairwise result stands.
@@ -143,12 +152,38 @@ the fit, not as a calibrated antenna measurement. On the house this was built
 against the spread came out at about 11 dB, which at n=2.5 is a factor of 2.7 in
 implied distance — far too large to leave uncorrected either way.
 
-**Known limitation: the vertical axis is stretched.** A floor between two
-radios costs signal that the path-loss model books as distance, so cross-floor
-pairs read further apart than they are. On the two-storey house this was built
-against, storeys about 3 m apart come out roughly 10-13 m apart. The floors
-separate in the right order and same-floor distances are plausible, but do not
-read the vertical scale as metres.
+### The vertical axis
+
+A floor between two radios costs signal that the path-loss model books as
+distance, so left alone the vertical axis inflates badly: on the house this was
+built against, radios on a single storey solved 6.3 m apart *vertically* and the
+two storeys 7.4 m apart, both around 2.5x anything a building can do.
+
+Two bounds fix that, and both are generic American construction rather than
+facts about any particular house, so they cost nothing in portability:
+
+| bound | value | source |
+| --- | --- | --- |
+| Within one storey | 2.4 m | floor-to-ceiling, the 8 ft traditional US ceiling |
+| Between adjacent storeys | 2.9 m +/- 0.4 | floor-to-floor: ceiling plus the floor assembly. Cross-checked against stair geometry, where a flight's total rise *is* the floor-to-floor height: 14-15 risers at 7-7.75 in (the IRC cap) gives 2.7-2.95 m |
+
+They are applied as **dead-zone projections** after each sweep: they do nothing
+until the layout leaves the range a building could occupy, then move it only to
+the nearest edge. Nothing is asserted beyond "that answer is impossible".
+
+The horizontal spread a link needs is recovered on its own by the next sweep,
+since a spring whose rest length is unchanged but whose vertical component just
+shrank must grow horizontally. Projecting between majorization steps this way is
+standard constrained SMACOF and keeps the monotone convergence guarantee;
+redistributing the excess by hand would not.
+
+On the two live captures this took the within-floor spread from 6.31 m to under
+0.1 m and the storey gap from 7.35 m to 2.50 m.
+
+**What it costs:** genuine height differences within a storey are flattened to a
+few centimetres. A radio on a shelf and one on the floor come out level. That
+detail was never recoverable from RSSI -- it sits far below the noise -- and
+giving it up buys a materially better horizontal layout.
 
 This is not fixable from signal alone. Fitting a single cross-floor penalty by
 minimising stress was tried and does not work: with five anchors, 3D MDS has

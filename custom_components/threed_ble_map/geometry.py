@@ -83,6 +83,13 @@ def solve_layout(
     # moves the points off the pairwise estimates and onto the raw readings.
     stress = _stress(matrix, coords)
 
+    # Orient *before* refining, not just after. MDS returns an arbitrary
+    # rotation, so until this runs the third coordinate is just some axis --
+    # and refine.py constrains that coordinate against how tall a storey is,
+    # which is only meaningful once it actually points up. Rotating first costs
+    # nothing (it changes no distance) and makes the constraint real.
+    coords = _apply_orientation(_orientation(anchors, coords, levels or {}), coords)
+
     # The pairwise fit assumes every radio reads RSSI the same way. Refine it
     # against the raw observations, solving each radio's gain at the same time.
     from .refine import refine_layout
@@ -109,7 +116,13 @@ def solve_layout(
             refined = corrected
         coords = refined["positions"]
 
-    transform = _orientation(anchors, coords, levels or {})
+    # Only centre here -- do NOT rotate again. Refinement holds the storeys
+    # apart along z, so the layout comes back already the right way up, and
+    # _orientation would undo that: it takes "up" to be the vector between floor
+    # centroids, which is mostly *horizontal* whenever the two storeys are not
+    # stacked directly on top of each other. That re-rotation turned a layout
+    # whose floors were flat to 0.02 m into one spread over 10 m.
+    transform = (_centroid(coords), None)
     coords = _apply_orientation(transform, coords)
     beacons = _oriented_beacons(refined, transform)
 
@@ -365,12 +378,17 @@ def _jacobi_eigen(
 def _orientation(
     anchors: Sequence[str], coords: list[list[float]], levels: dict[str, float]
 ) -> tuple[list[float], list[list[float]] | None]:
-    """Pick a rigid motion that puts the building's floors the right way up.
+    """Pick a rigid motion that puts the building's floors roughly the right way up.
 
-    MDS returns an arbitrary rotation. Home Assistant knows which floor each
-    anchor is on, so use that to choose one. Returned as a transform rather than
-    applied in place because beacons have to move with the radios: rotating the
-    two sets independently would tear the solution apart.
+    MDS returns an arbitrary rotation, and refine.py constrains the third
+    coordinate against how tall a storey is, which is only meaningful once that
+    coordinate points up. This runs once, on the seed, to get it close.
+
+    It is only an approximation: "up" is taken as the vector between the floors'
+    centroids, so it tilts by however far the storeys are offset horizontally.
+    That is good enough as a starting frame, because the storey constraint then
+    takes over and effectively defines up for the rest of the solve. It is not
+    good enough to apply *after* refinement, which is why it no longer is.
     """
     centroid = _centroid(coords)
     centred = [[p[axis] - centroid[axis] for axis in range(3)] for p in coords]

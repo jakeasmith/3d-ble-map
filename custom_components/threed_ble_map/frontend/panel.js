@@ -476,9 +476,11 @@ class ThreeDBleMapPanel extends HTMLElement {
 const MAP_BLURB =
   "A rough relative layout, solved from how loudly each radio hears the others " +
   "and the beacons they share. Position is relative: the shape is meaningful, " +
-  "the origin is not. Note that the vertical axis is stretched — a floor " +
-  "between two radios eats signal that the path-loss model reads as distance, " +
-  "so storeys come out further apart than they are.";
+  "the origin is not. Heights are bounded by how houses are built rather than " +
+  "by RSSI, which says little that is trustworthy about the vertical axis: " +
+  "radios on one storey are held within a ceiling’s height of each other, and " +
+  "storeys a floor-to-floor pitch apart. Real height differences within a " +
+  "storey are flattened as a result — that detail is below the noise anyway.";
 
 const BEACON_BLURB =
   "Every beacon heard by at least three radios, placed by the same solve that " +
