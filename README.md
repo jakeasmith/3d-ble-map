@@ -322,7 +322,7 @@ So mobility is measured directly instead:
 
 | signal | what it is | why |
 | --- | --- | --- |
-| **motion** | RMS gap between a fast and a slow average of the same RSSI, meaned across radios | A real displacement holds the two averages apart; noise jitters the fast one around the slow one and cancels. Meaned, not maxed, so it does not grow with radio count |
+| **motion** | RMS gap between a fast and a slow average of the same RSSI, meaned across radios | A real displacement holds the two averages apart; noise jitters the fast one around the slow one and cancels. Meaned rather than maxed, which *reduces* the radio-count bias but does not remove it -- see the caveat below |
 | **persistence** | fraction of the recording the beacon was present for | The measurable half of "has a wired power supply". Every mains-powered fixture in the reference house was present for the whole window; transients sat at 3-5% |
 | **identity** | known to Home Assistant, and whether the address rotates | A device in the registry is installed kit. Privacy-rotating addresses -- phones and Tile/Chipolo-style trackers -- churn identity and never build a baseline; 227 of 443 addresses were rotating and only 3% of those persisted |
 
@@ -335,6 +335,21 @@ Identity uses Home Assistant's device registry, which ships with every install,
 rather than a list of vendor name prefixes. A hardcoded "Govee/ELK-BLEDOM" list
 would work in one house and nowhere else, which is the portability rule this
 project is built around.
+
+Two caveats, both measured:
+
+- **Motion is still somewhat confounded with proximity.** Beacons heard by four
+  or more radios average 2.08 dB of motion against 0.90 dB for single-radio
+  ones. That is better than the spread metric it replaced (3.36 vs 0.98 dB) but
+  it is not gone, because beacons heard by many radios are generally closer, and
+  strong signals genuinely swing more in dB. Well-observed beacons therefore
+  score a little worse than they deserve.
+- **Neither signal means anything for the first few minutes.** The slow average
+  has a time constant of about 165 seconds, so motion reads near zero until it
+  has diverged, and persistence reads ~1.0 for everything until the recording is
+  long enough for transients to drop out. Both need hours, not minutes.
+
+Since the score is reported rather than applied, neither costs any accuracy.
 
 ### Beacons have no yardstick, so they are cross-validated instead
 
