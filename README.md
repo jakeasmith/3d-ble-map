@@ -97,6 +97,16 @@ How it works:
    apart (2.9 m, plus or minus 0.4). Beacons are held inside the same building
    envelope. See *The vertical axis* below.
 
+6. **Weighting each observation by what it is worth.** A reading's pull is
+   scaled by 1/d^2, which makes minimising the sum equivalent to minimising
+   squared dB error -- the maximum-likelihood objective, since shadowing is
+   Gaussian in dB and so a fixed dB error is a *proportional* distance error.
+   That is only the right weight if every observation shares one sigma and each
+   is independent, and radio-to-radio links are neither. See *What an
+   observation is worth* below.
+7. **Starting from last time.** The previous layout is offered back as one more
+   starting point, and ties go to not moving. See *Standing still* below.
+
 Refinement only replaces the pairwise layout if it actually fits the data
 better; otherwise the pairwise result stands.
 
@@ -152,6 +162,113 @@ the fit, not as a calibrated antenna measurement. On the house this was built
 against the spread came out at about 11 dB, which at n=2.5 is a factor of 2.7 in
 implied distance — far too large to leave uncorrected either way.
 
+### Scale, and the parameters a fit spends
+
+Inverting the path-loss law on a noisy reading does not give the distance, it
+gives a log-normal whose *mean* sits above the true distance by
+exp(a^2 sigma^2 / 2). At the 8-ish dB a real house produces that is a 30%
+inflation of the entire map, so the sigma has to be estimated and divided out.
+
+The trap is that sigma is not the fit residual, and using the residual is how
+this map came to solve 1.74x too large while the correction meant to prevent
+that was running and reporting success. A fit spends its parameters absorbing
+exactly the deviations it is being asked to measure: every beacon carries three
+free coordinates, so a beacon heard by four radios moves to soak up most of its
+own shadowing and reports almost none of it back.
+
+Count them. One real capture fits 171 parameters -- three coordinates for each
+radio and beacon, less the six rigid motions no data can pin, plus one gain per
+radio less the one removed by holding gains to zero mean -- against 308
+observations. That leaves 137 degrees of freedom, and the residual understates
+sigma by sqrt(308/137) = 1.5x. The textbook estimator sigma^2 = RSS/(n - p) is
+the fix. Averaged over 8 perturbed inputs so no single lucky solve decides it:
+
+| | scale | position RMS |
+| --- | --- | --- |
+| residual as sigma | 1.69x | 4.31 m |
+| dof-corrected | 1.37x | 3.06 m |
+
+This is worth internalising before adding anything to the model, because a real
+house's fit is *parameter-starved* and most additions make it worse. See *Fits
+better, locates worse* below.
+
+### What an observation is worth
+
+Direct radio-to-radio links were carrying 5.5% of the pull that reaches the
+radios: 18 measurements against 290 beacon readings, and further penalised by
+1/d^2 for spanning the whole house. They are also the only measurement in the
+system whose *both* endpoints are fixed, mains-powered and of known storey.
+
+Two measured reasons a link is worth more, multiplied, both computed from each
+fit rather than fixed in the source:
+
+| factor | this house | why |
+| --- | --- | --- |
+| scatter | 1.7 | A link has no unknown transmit power and is averaged over both directions. Measured, it scatters 5.8 dB against 8.5 dB for a beacon reading; GLS weights by 1/sigma^2 |
+| redundancy | 2.1 | A beacon carries three unknown coordinates, so of the k readings it contributes, three are spent pinning the beacon itself and only k - 3 constrain the radios. At k = 5.8 that is 2.8 of 5.8. A link spends nothing |
+
+They derive 3.5 here; an empirical sweep independently liked 3.0, which is the
+agreement worth having, since a swept constant would have been tuned to one
+house. A house with more radios per beacon derives a smaller number.
+
+| | scale | position RMS |
+| --- | --- | --- |
+| 1/d^2 only | 1.37x | 3.06 m |
+| per-class weights | 1.38x | 2.43 m |
+
+The scatter term alone derives 1.7 and buys nothing. The redundancy term is
+where the win is -- the same effect the dof correction addresses one layer up.
+
+### Standing still
+
+SMACOF is a local method, and the search used to start cold on every poll. Two
+minima a hundredth of a dB apart are indistinguishable as fits but metres apart
+as layouts, so a best-of-six pick was free to alternate and the house visibly
+jumped between polls. Nudging the smoothed RSSI by a quarter of a dB -- less
+than the recorder smooths away between polls -- moved pairwise distances 1.03 m
+RMS, and the response was not monotone in the size of the nudge. That is
+minimum-hopping, not sensitivity to the data.
+
+The previous layout now competes as one more starting point, and ties go to not
+moving. Over 10 consecutive solves of perturbed input:
+
+| | movement between solves | position RMS |
+| --- | --- | --- |
+| cold every solve | 2.21 m | 2.74 m |
+| warm, no margin | 2.41 m | 2.58 m |
+| warm + 2% margin | 1.01 m | 2.33 m |
+
+Warm-starting on its own buys nothing; the margin is the mechanism, because what
+needed fixing was the choice between near-equal minima and not where the search
+began. 2% is the smallest value on a plateau running unchanged to 20%.
+
+There is deliberately no release condition. The cold multi-restart search still
+runs in full every solve and takes over the moment it genuinely fits better, so
+this cannot latch onto a stale layout when a radio actually moves.
+
+### Fits better, locates worse
+
+Two plausible additions were built and measured against the yardstick, and both
+lowered the fit residual while moving the radios further from where they are.
+Neither is in the code. A real house's fit has little redundancy to spare, so
+new parameters get spent memorising shadowing:
+
+| | fit residual | position RMS |
+| --- | --- | --- |
+| baseline | 7.6 dB | 2.61 m |
+| per-beacon transmit power | 5.1 dB | 4.60 m |
+| beacon height pinned to its storey | 7.7 dB | 3.60 m |
+
+Per-beacon transmit power is the more tempting of the two, and the effect it
+chases is real: -59 dBm at 1 m is a nominal, and the per-beacon offset measures
+3.67 dB RMS across -7.7 to +5.7 dB, a 40% systematic range bias. It is
+structurally identical to the per-radio gain that *is* solved, and identifiable
+for 44 of this house's 50 placed beacons. It still loses, and it still loses
+after the degrees-of-freedom count is corrected to include the new parameters.
+
+The lesson generalises: on this problem, judge a change by where it puts the
+radios, never by the residual. The residual is what the extra parameters eat.
+
 ### The vertical axis
 
 A floor between two radios costs signal that the path-loss model books as
@@ -197,7 +314,7 @@ around the vertical axis are arbitrary: the *shape* is the output, not the
 coordinates. Treat it as a starting point to correct by hand, not a survey.
 
 Against synthetic ground truth (5 anchors, two storeys, 120 beacons, 2 dB noise)
-the recovered shape had ~0.9 m RMS error across a 9 m house. With the radios
+the recovered shape had ~1.2 m RMS error across a 9 m house. With the radios
 deliberately miscalibrated by -6 to +5 dB, the solver recovers each radio's
 offset to 0.58 dB mean error and holds shape error to 1.09 m; ignoring
 calibration instead gives 3.07 m.
