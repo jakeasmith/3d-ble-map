@@ -41,6 +41,7 @@ class ThreeDBleMapPanel extends HTMLElement {
     this._sceneLoading = false;
     this._showEdges = true;
     this._showBeacons = true;
+    this._expanded = false;
     this._rendered = false;
   }
 
@@ -65,6 +66,12 @@ class ThreeDBleMapPanel extends HTMLElement {
     window.addEventListener("resize", this._onResize);
     this._onPopState = () => this._setView(pathToView(location.pathname), false);
     window.addEventListener("popstate", this._onPopState);
+    // Escape is the way out of anything that covers the screen, so it has to
+    // work here even though this is a page element rather than a real dialog.
+    this._onKeyDown = (event) => {
+      if (event.key === "Escape" && this._expanded) this._setExpanded(false);
+    };
+    window.addEventListener("keydown", this._onKeyDown);
   }
 
   _upgradeProperty(name) {
@@ -80,6 +87,56 @@ class ThreeDBleMapPanel extends HTMLElement {
     this._timer = null;
     window.removeEventListener("resize", this._onResize);
     window.removeEventListener("popstate", this._onPopState);
+    window.removeEventListener("keydown", this._onKeyDown);
+    this._setExpanded(false);
+    // Unconditional, not just via _setExpanded: if the shadow root has already
+    // gone the toggle cannot run, and a stranded scroll lock on document.body
+    // outlives this element with no way left to undo it.
+    document.body.style.overflow = "";
+    this._expanded = false;
+  }
+
+  // Full screen within the browser window: the card is pinned over the
+  // viewport rather than handed to the compositor. No permission prompt, no
+  // display-mode change, and it composes with Home Assistant's own sidebar.
+  //
+  // The controls are *moved* into the card rather than duplicated, so the same
+  // two checkboxes keep their existing listeners and state either way.
+  _setExpanded(expanded) {
+    if (!this.shadowRoot) return;
+    const card = this.shadowRoot.getElementById("canvas-card");
+    const button = this.shadowRoot.getElementById("expand");
+    const controls = this.shadowRoot.querySelector(".controls");
+    if (!card) {
+      this._expanded = false;
+      document.body.style.overflow = "";
+      return;
+    }
+    if (this._expanded === expanded) return;
+    this._expanded = expanded;
+
+    card.classList.toggle("expanded", expanded);
+    if (button) {
+      button.textContent = expanded ? "Exit" : "Expand";
+      button.title = expanded
+        ? "Back to the page (Esc)"
+        : "Fill the browser window (Esc to exit)";
+    }
+    if (controls) {
+      if (expanded) {
+        this._controlsHome = controls.parentNode;
+        this._controlsNext = controls.nextSibling;
+        card.appendChild(controls);
+      } else if (this._controlsHome) {
+        this._controlsHome.insertBefore(controls, this._controlsNext);
+      }
+    }
+    // The page behind must not scroll under a fixed overlay.
+    document.body.style.overflow = expanded ? "hidden" : "";
+
+    // The canvas backing store is sized from its measured box, so it can only
+    // be resized once the browser has laid the new geometry out.
+    requestAnimationFrame(() => this._scene && this._scene.resize());
   }
 
   async _refresh() {
@@ -106,6 +163,8 @@ class ThreeDBleMapPanel extends HTMLElement {
 
   _setView(view, push = true) {
     if (view === this._view) return;
+    // The overlay belongs to the map; leaving the tab must take it down.
+    this._setExpanded(false);
     this._view = view;
     if (push) {
       history.pushState(
@@ -256,7 +315,11 @@ class ThreeDBleMapPanel extends HTMLElement {
       container.innerHTML = `
         <div class="sub">${MAP_BLURB}</div>
         <div class="stats" id="stats"></div>
-        <div class="card canvas-card"><canvas id="scene"></canvas></div>
+        <div class="card canvas-card" id="canvas-card">
+          <canvas id="scene"></canvas>
+          <button class="expand-button" id="expand" type="button"
+                  title="Fill the browser window (Esc to exit)">Expand</button>
+        </div>
         <div class="controls">
           <label><input type="checkbox" id="show-edges" /> Show links between radios</label>
           <label><input type="checkbox" id="show-beacons" /> Show beacons</label>
@@ -291,6 +354,12 @@ class ThreeDBleMapPanel extends HTMLElement {
       this._sceneLoading = true;
       loadScene().then(({ AnchorScene }) => {
         this._sceneLoading = false;
+        const expand = this.shadowRoot.getElementById("expand");
+        if (expand) {
+          expand.addEventListener("click", () =>
+            this._setExpanded(!this._expanded),
+          );
+        }
         const canvas = this.shadowRoot.getElementById("scene");
         if (!canvas) return;
         this._scene = new AnchorScene(canvas);
@@ -532,9 +601,37 @@ const STYLES = `
     box-shadow: var(--ha-card-box-shadow, 0 2px 4px rgba(0,0,0,.14));
     overflow-x: auto;
   }
-  .canvas-card { overflow: hidden; }
-  canvas { width: 100%; height: 460px; display: block; touch-action: none; cursor: grab; }
+  .canvas-card { overflow: hidden; position: relative; }
+  /* Tall enough to be worth orbiting, but bounded at both ends: a short laptop
+     window should still show the stats above it, and a tall monitor should not
+     stretch the scene into a strip. */
+  canvas {
+    width: 100%; height: clamp(460px, 68vh, 900px);
+    display: block; touch-action: none; cursor: grab;
+  }
   canvas:active { cursor: grabbing; }
+
+  /* Full screen *within the page*, not the system compositor: no permission
+     prompt, no mode switch, and Home Assistant's own chrome stays one Escape
+     away. */
+  .canvas-card.expanded {
+    position: fixed; inset: 0; z-index: 10;
+    margin: 0; border-radius: 0; border: 0;
+  }
+  .canvas-card.expanded canvas { height: 100%; }
+  .canvas-card.expanded .controls {
+    position: absolute; left: 16px; bottom: 16px; margin: 0;
+    padding: 8px 12px; border-radius: 10px;
+    background: rgba(0, 0, 0, .55); backdrop-filter: blur(4px);
+  }
+  .expand-button {
+    position: absolute; top: 12px; right: 12px; z-index: 1;
+    padding: 6px 12px; border-radius: 8px; cursor: pointer;
+    font: inherit; font-size: 13px; color: inherit;
+    border: 1px solid var(--divider-color, rgba(127,127,127,.4));
+    background: rgba(0, 0, 0, .45); backdrop-filter: blur(4px);
+  }
+  .expand-button:hover { background: rgba(0, 0, 0, .7); }
   table { border-collapse: collapse; width: 100%; font-size: 14px; }
   th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--divider-color); white-space: nowrap; }
   th { font-weight: 500; color: var(--secondary-text-color); }
