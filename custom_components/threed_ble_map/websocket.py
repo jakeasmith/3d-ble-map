@@ -17,7 +17,7 @@ from homeassistant.helpers import (
     floor_registry as fr,
 )
 
-from . import geometry
+from . import geometry, quality
 from .const import (
     DEFAULT_SIGNAL_LIMIT,
     DOMAIN,
@@ -363,20 +363,58 @@ async def _async_cached_solve(
     # Snapshot the recorder on the event loop, then do the arithmetic off it.
     direct = recorder.direct_links(ordered)
     observations = recorder.observations(ordered)
-    rejected = len(recorder.unstable(ordered))
-    tracked = len(recorder.stability(ordered))
+    evidence = recorder.beacon_quality(ordered)
+    known = _known_addresses(dr.async_get(hass))
+    weights = {
+        address: quality.beacon_weight(
+            facts["motion"], facts["persistence"], address, address in known
+        )
+        for address, facts in evidence.items()
+    }
+    tracked = len(evidence)
 
+    # The trust score is reported, not applied. Passing it to solve_layout as a
+    # spring multiplier was built, measured, and rejected: downweighting suspect
+    # beacons made the layout monotonically worse (shape error 2.75 m trusting
+    # them, 2.98 m at 0.7x, 4.02 m at 0.4x, with 15 of ~120 beacons caught
+    # mid-move), and at heavier contamination it did not help on a single seed.
+    #
+    # The reason is that _pull already applies a Huber weight to each reading's
+    # own residual. That is evidence from the fit itself about whether a reading
+    # is consistent, which strictly beats a prior guess about whether it might
+    # be -- and a prior on top only removes constraint mass the solver needs.
+    #
+    # solve_layout still accepts weights and the path is tested, so this is one
+    # argument away if better evidence turns up.
     result = await hass.async_add_executor_job(
         partial(geometry.solve_layout, ordered, direct, observations, levels)
     )
     result["beacons"] = _describe_beacons(
-        result.get("beacons") or [], observations, recorder.names(), anchors
+        result.get("beacons") or [], observations, recorder.names(), anchors,
+        evidence, known, weights,
     )
-    result["rejected_beacons"] = rejected
+    result["weighted_beacons"] = sum(1 for w in weights.values() if w >= 0.5)
+    result["trust"] = weights
     result["tracked_beacons"] = tracked
 
     cache.update({"result": result, "key": key, "at": now})
     return result
+
+
+def _known_addresses(device_reg: dr.DeviceRegistry) -> set[str]:
+    """Every MAC Home Assistant already associates with a device it manages.
+
+    A beacon Home Assistant knows about is installed kit -- a light, a sensor, a
+    television -- rather than something passing through, which is exactly the
+    distinction the weighting wants. Built as one reverse index because doing a
+    registry scan per beacon would be hundreds of scans on the event loop.
+    """
+    return {
+        value.upper()
+        for device in device_reg.devices.values()
+        for _kind, value in device.connections
+        if isinstance(value, str)
+    }
 
 
 def _describe_beacons(
@@ -384,6 +422,9 @@ def _describe_beacons(
     observations: dict[str, dict[str, float]],
     names: dict[str, str],
     anchors: dict[str, dict[str, Any]],
+    evidence: dict[str, dict[str, float]] | None = None,
+    known: set[str] | None = None,
+    trust: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Attach a name and a nearest radio to each solved beacon.
 
@@ -403,10 +444,16 @@ def _describe_beacons(
         }
         loudest = max(heard, key=heard.get) if heard else None
         anchor = anchors.get(loudest) if loudest else None
+        facts = (evidence or {}).get(address, {})
         described.append(
             {
                 **beacon,
                 "name": names.get(address),
+                "motion": facts.get("motion"),
+                "persistence": facts.get("persistence"),
+                "known_device": bool(known and address.upper() in known),
+                "address_kind": quality.address_kind(address),
+                "trust": round((trust or {}).get(address, 1.0), 2),
                 "nearest_anchor": anchor["label"] if anchor else None,
                 "nearest_area": anchor["area"] if anchor else None,
                 "rssi": round(heard[loudest]) if loudest else None,
@@ -467,14 +514,10 @@ def ws_raw_observations(
             "anchors": anchors,
             "elapsed": round(recorder.elapsed),
             "observations": recorder.observations(sources),
-            "all_observations": recorder.observations(sources, stable_only=False),
             "direct_links": [
                 {"listener": a, "advertiser": b, "rssi": v}
                 for (a, b), v in recorder.direct_links(sources).items()
             ],
-            "stability": {
-                address: {"spread": round(spread, 2), "samples": samples}
-                for address, (spread, samples) in recorder.stability(sources).items()
-            },
+            "quality": recorder.beacon_quality(sources),
         },
     )

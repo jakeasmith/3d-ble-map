@@ -173,6 +173,7 @@ def refine_layout(
     direct_rssi: dict[tuple[str, str], list[float]],
     levels: dict[str, float] | None = None,
     shadowing_db: float = 0.0,
+    beacon_weights: dict[str, float] | None = None,
 ) -> dict[str, Any] | None:
     """Refine an initial layout, solving per-radio gain at the same time.
 
@@ -196,6 +197,11 @@ def refine_layout(
         for b, beacon in enumerate(beacons)
         for radio in radios
         if beacon in observations[radio]
+    ]
+    # How far each beacon is trusted as a fixed landmark. Uniform when nothing
+    # is known, which is what the tests and the offline scorer run with.
+    weights_by_beacon = [
+        (beacon_weights or {}).get(beacon, 1.0) for beacon in beacons
     ]
     links = [
         (index[listener], index[advertiser], sum(values) / len(values))
@@ -256,6 +262,7 @@ def refine_layout(
                 _majorize(
                     points, beacon_points, gains, readings, links,
                     floor_groups, bias, radio_levels, penalty,
+                    weights_by_beacon,
                 )
                 _constrain_storeys(points, storeys)
                 _constrain_beacons(beacon_points, points, storeys)
@@ -477,6 +484,7 @@ def _majorize(
     bias: float,
     radio_levels: list[float | None] | None = None,
     floor_penalty: float = 0.0,
+    beacon_weights: list[float] | None = None,
 ) -> None:
     """One SMACOF sweep: move every point to where its springs want it.
 
@@ -488,7 +496,7 @@ def _majorize(
     targets = [[0.0] * 3 for _ in points]
     weights = [0.0] * len(points)
     beacon_targets = [[0.0] * 3 for _ in beacon_points]
-    beacon_weights = [0.0] * len(beacon_points)
+    beacon_pulls = [0.0] * len(beacon_points)
 
     levels = radio_levels or [None] * len(points)
     beacon_levels = (
@@ -503,14 +511,18 @@ def _majorize(
         rest = _rest_length(observed - gains[radio] + crossed, bias)
         if rest is None:
             continue
-        _pull(points[radio], beacon_points[beacon], rest, targets[radio], weights, radio)
+        trust = beacon_weights[beacon] if beacon_weights else 1.0
         _pull(
-            beacon_points[beacon],
-            points[radio],
-            rest,
-            beacon_targets[beacon],
-            beacon_weights,
-            beacon,
+            points[radio], beacon_points[beacon], rest,
+            targets[radio], weights, radio, trust,
+        )
+        # Scaling the beacon's own side too is a no-op for where the beacon
+        # lands -- every one of its springs carries the same factor, so it
+        # cancels in its weighted average -- but it keeps the two sides
+        # symmetric and costs nothing.
+        _pull(
+            beacon_points[beacon], points[radio], rest,
+            beacon_targets[beacon], beacon_pulls, beacon, trust,
         )
 
     for listener, advertiser, observed in links:
@@ -540,7 +552,7 @@ def _majorize(
     for i, weight in enumerate(weights):
         if weight > 0:
             points[i] = [value / weight for value in targets[i]]
-    for b, weight in enumerate(beacon_weights):
+    for b, weight in enumerate(beacon_pulls):
         if weight > 0:
             beacon_points[b] = [value / weight for value in beacon_targets[b]]
 
@@ -552,8 +564,14 @@ def _pull(
     target: list[float],
     weights: list[float],
     index: int,
+    trust: float = 1.0,
 ) -> None:
-    """Accumulate one spring's preferred position for `point`."""
+    """Accumulate one spring's preferred position for `point`.
+
+    `trust` scales the whole spring by how good a landmark the other end is, so
+    a mains-powered light fitting bends the layout more than a tracker in
+    someone's pocket. See quality.py for where the number comes from.
+    """
     delta = [point[axis] - neighbour[axis] for axis in range(3)]
     distance = math.sqrt(sum(value * value for value in delta))
     if distance < MIN_SEPARATION_M:
@@ -579,6 +597,7 @@ def _pull(
     # short dominate everything, and the whole map collapses inward -- measured
     # at 0.57x true scale before this was corrected.
     weight /= distance * distance
+    weight *= trust
 
     for axis in range(3):
         target[axis] += weight * (neighbour[axis] + rest * delta[axis] / distance)

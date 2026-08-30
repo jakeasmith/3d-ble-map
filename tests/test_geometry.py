@@ -38,6 +38,7 @@ def _load(name: str):
 
 geometry = _load("geometry")
 refine = _load("refine")
+quality = _load("quality")
 
 # A two-storey house, metres. Mirrors the real deployment: five anchors, three
 # of which advertise and so can be heard directly by the others.
@@ -432,6 +433,93 @@ def test_floors_are_physical() -> bool:
     return ok
 
 
+def test_beacon_weighting() -> bool:
+    """A beacon that moves must bend the layout less than one that does not.
+
+    The weighting exists because beacons are not interchangeable: a mains
+    powered light fitting is a better landmark than a tracker in a pocket. This
+    checks the weight arithmetic, and then that handing the solver a moved
+    beacon at low weight actually protects the layout.
+    """
+    ok = check(
+        "a rotating address is recognised",
+        quality.address_kind("7E:C1:6F:2B:26:A2") == "rotating"
+        and quality.address_kind("A4:C1:38:4A:CB:3A") == "public",
+        "resolvable-private and public addresses classified",
+    )
+    still = quality.beacon_weight(0.2, 1.0, "A4:C1:38:4A:CB:3A", True)
+    moving = quality.beacon_weight(9.0, 1.0, "A4:C1:38:4A:CB:3A", True)
+    ok &= check(
+        "movement costs a beacon its weight",
+        moving < still / 4,
+        f"still {still:.2f} vs moving {moving:.2f}",
+    )
+    transient = quality.beacon_weight(0.2, 0.04, "7E:C1:6F:2B:26:A2", False)
+    ok &= check(
+        "a rotating, briefly-seen address is nearly ignored",
+        transient <= 0.05,
+        f"weight {transient:.3f}, at the floor of {quality.BEACON_MIN_WEIGHT}",
+    )
+    ok &= check(
+        "nothing is discarded outright",
+        quality.beacon_weight(1e6, 0.0, "7E:C1:6F:2B:26:A2", False) > 0,
+        "weights stay positive, so weighting is continuous not a gate",
+    )
+
+    # And the finding that decided how this ships. Downweighting beacons caught
+    # mid-move -- the case the weighting was built for -- makes the layout
+    # monotonically *worse*: 2.75 m trusting them, 2.98 m at 0.7x, 4.02 m at
+    # 0.4x, 4.38 m at the floor, with 15 of ~120 beacons contaminated. At
+    # heavier contamination it did not help on a single seed.
+    #
+    # _pull already applies a Huber weight to each reading's own residual, which
+    # is evidence from the fit about whether a reading is consistent. A prior
+    # guess on top only removes constraint mass. So the trust score is reported
+    # to the user and not applied to the springs, and this check exists so that
+    # anyone who wires it up sees the cost rather than assuming a benefit.
+    global NOISE_DB
+    previous = NOISE_DB
+    NOISE_DB = REALISTIC_NOISE_DB
+    try:
+        random.seed(4)
+        direct, observations, truth = simulate()
+    finally:
+        NOISE_DB = previous
+
+    rng = random.Random(99)
+    everywhere = [
+        b for b in truth
+        if sum(1 for a in TRUTH if b in observations[a]) == len(TRUTH)
+    ]
+    victims = rng.sample(everywhere, min(15, len(everywhere)))
+    for victim in victims:
+        here = (rng.uniform(-2, 12), rng.uniform(-2, 10), rng.uniform(0, 3.5))
+        there = (rng.uniform(-2, 12), rng.uniform(-2, 10), rng.uniform(0, 3.5))
+        for i, anchor in enumerate(TRUTH):
+            if victim in observations[anchor]:
+                spot = here if i % 2 == 0 else there
+                observations[anchor][victim] = (
+                    geometry.TX_POWER_AT_1M
+                    - 10 * geometry.PATH_LOSS_EXPONENT
+                    * math.log10(max(0.3, math.dist(TRUTH[anchor], spot)))
+                )
+
+    trusted = geometry.solve_layout(list(TRUTH), direct, observations, LEVELS)
+    downweighted = geometry.solve_layout(
+        list(TRUTH), direct, observations, LEVELS,
+        {victim: quality.BEACON_MIN_WEIGHT for victim in victims},
+    )
+    kept = shape_error(trusted["positions"])
+    dropped = shape_error(downweighted["positions"])
+    ok &= check(
+        "downweighting mid-move beacons is still not a win",
+        dropped >= kept,
+        f"{kept:.2f}m trusting {len(victims)} moving beacons vs {dropped:.2f}m "
+        f"downweighting them -- Huber on the residual already covers this",
+    )
+    return ok
+
+
 def test_edge_cases() -> bool:
     ok = check(
         "too few anchors is an error",
@@ -464,6 +552,7 @@ def main() -> int:
         test_recovers_uncalibrated_gains,
         test_places_beacons,
         test_floors_are_physical,
+        test_beacon_weighting,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")

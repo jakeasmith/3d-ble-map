@@ -29,12 +29,24 @@ RECORDER_STALE_AFTER = timedelta(minutes=10)
 # The layout is only worth showing once a little history has accumulated.
 MIN_RECORDING_SECONDS = 30
 
-# Beacon quality. A beacon that is being carried around breaks the assumption
-# that the geometry is static, and its readings pull the layout with it. Spread
-# is the smoothed mean absolute deviation of its RSSI; a stationary beacon sits
-# near the radio noise floor, a moving one swings far wider.
-BEACON_MAX_SPREAD_DB = 6.0
+# A second, much slower average of the same RSSI. The gap between the fast and
+# slow averages is what a beacon *moving* looks like: a real displacement shows
+# up as a sustained offset between them, while radio noise jitters the fast
+# average around the slow one and cancels. One extra float per link buys a
+# motion detector without keeping any history.
+RECORDER_SLOW_SMOOTHING = 0.03
+
+# A beacon needs a few readings before any of its statistics mean anything.
 BEACON_MIN_SAMPLES = 4
+
+# Motion, in dB, at which a beacon is trusted half as much. Roughly the shift a
+# metre of movement produces at mid-range under the path-loss model.
+BEACON_MOTION_SCALE_DB = 3.0
+
+# No beacon is discarded outright -- weighting is continuous, and even a phone
+# in a pocket says something about which radios can hear each other. This is the
+# least a beacon can be trusted.
+BEACON_MIN_WEIGHT = 0.05
 
 # The layout solve takes hundreds of milliseconds, which must not happen on the
 # event loop. It runs in an executor and the result is cached: the geometry

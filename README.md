@@ -275,6 +275,67 @@ right is part of the job.
 Room centres are only good to about +/- 1.5 m, since the hardware sits on a wall
 rather than mid-room. A result better than that is not measurably better.
 
+### Not all beacons are worth the same
+
+A mains-powered light fitting bolted to a ceiling is a far better landmark than
+a tracker in someone's pocket, so every beacon carries a **trust** score in the
+table and the API.
+
+**It is reported, not applied, and that was a measurement rather than a
+decision.** Multiplying each beacon's springs by its trust was built and tested,
+and it makes the layout monotonically worse. Contaminating 15 of ~120 beacons so
+that different radios saw them in different places -- what a smoothed average
+holds while something is being carried around:
+
+| spring weight on suspect beacons | shape error |
+| --- | --- |
+| 1.0 (trust them) | 2.75 m |
+| 0.7 | 2.98 m |
+| 0.4 | 4.02 m |
+| 0.05 | 4.38 m |
+
+At heavier contamination it did not help on a single seed. The reason is that
+`_pull` already applies a Huber weight to each reading's own residual -- evidence
+from the fit about whether a reading is *actually* consistent, which beats a
+prior guess about whether it might be. A prior on top only removes constraint
+mass the solver needs. `solve_layout` still accepts weights and the path is
+tested, so this is one argument away if better evidence appears.
+
+What the score is good for is reading the map: it tells you which dots are
+landmarks and which are someone's headphones.
+
+**The obvious signal is the wrong one.** RSSI *spread* looks like a mobility
+detector and is not. Measured across a real house:
+
+| | mean spread |
+| --- | --- |
+| Devices that move (headset, camera, portable speaker) | 2.7 dB |
+| Devices that cannot (bulbs, LED controllers, TVs, a door lock) | 3.7 dB |
+
+Backwards, and the noisiest "fixed" device was a mains-powered smart bulb at
+7.1 dB. Spread correlates with *signal strength* (Spearman +0.53) and with how
+many radios hear a beacon -- it was taken as the maximum across radios, and the
+maximum of k samples grows with k. Gating on it rejected beacons for being well
+observed, which is the opposite of what you want.
+
+So mobility is measured directly instead:
+
+| signal | what it is | why |
+| --- | --- | --- |
+| **motion** | RMS gap between a fast and a slow average of the same RSSI, meaned across radios | A real displacement holds the two averages apart; noise jitters the fast one around the slow one and cancels. Meaned, not maxed, so it does not grow with radio count |
+| **persistence** | fraction of the recording the beacon was present for | The measurable half of "has a wired power supply". Every mains-powered fixture in the reference house was present for the whole window; transients sat at 3-5% |
+| **identity** | known to Home Assistant, and whether the address rotates | A device in the registry is installed kit. Privacy-rotating addresses -- phones and Tile/Chipolo-style trackers -- churn identity and never build a baseline; 227 of 443 addresses were rotating and only 3% of those persisted |
+
+Persistence means *always-on*, not *immobile* -- a headset and a camera were
+both present for the entire window and both move. Motion is what catches those,
+which is why it is the primary signal and the other two are priors for the
+cold-start window before there is enough history to measure movement.
+
+Identity uses Home Assistant's device registry, which ships with every install,
+rather than a list of vendor name prefixes. A hardcoded "Govee/ELK-BLEDOM" list
+would work in one house and nowhere else, which is the portability rule this
+project is built around.
+
 ### Beacons have no yardstick, so they are cross-validated instead
 
 The floor plan locates the radios and nothing else, so it cannot say whether a

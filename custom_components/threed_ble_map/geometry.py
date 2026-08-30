@@ -57,6 +57,7 @@ def solve_layout(
     direct_rssi: dict[tuple[str, str], list[float]],
     observations: dict[str, dict[str, float]],
     levels: dict[str, float] | None = None,
+    beacon_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Estimate a relative 3D position for each anchor.
 
@@ -65,6 +66,8 @@ def solve_layout(
         each other. Both directions are averaged when both exist.
     observations: anchor id -> {beacon address: RSSI} for shared beacons.
     levels: anchor id -> building floor level, used only to orient the result.
+    beacon_weights: beacon address -> how far to trust it as a fixed landmark,
+        from quality.py. Absent or missing entries are trusted fully.
     """
     if len(anchors) < 3:
         return _empty("At least 3 anchors are needed to estimate a layout.")
@@ -102,7 +105,10 @@ def solve_layout(
     # uses that to undo the log-normal bias, which at a real house's noise level
     # inflates every distance by about 30%. Estimating it from the fit is the
     # only option -- nothing else in the system knows the shadowing figure.
-    refined = refine_layout(anchors, seed, observations, direct_rssi, levels)
+    refined = refine_layout(
+        anchors, seed, observations, direct_rssi, levels,
+        beacon_weights=beacon_weights,
+    )
     if refined is not None:
         corrected = refine_layout(
             anchors,
@@ -111,6 +117,7 @@ def solve_layout(
             direct_rssi,
             levels,
             shadowing_db=refined["residual_db"],
+            beacon_weights=beacon_weights,
         )
         if corrected is not None:
             refined = corrected

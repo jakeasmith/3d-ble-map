@@ -8,6 +8,7 @@ dB between adverts. This keeps an exponentially weighted average per
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,9 +18,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
-    BEACON_MAX_SPREAD_DB,
     BEACON_MIN_SAMPLES,
     RECORDER_INTERVAL,
+    RECORDER_SLOW_SMOOTHING,
     RECORDER_SMOOTHING,
     RECORDER_STALE_AFTER,
 )
@@ -34,23 +35,36 @@ _MAC_TOLERANCE = 4
 
 @dataclass
 class _Reading:
-    """One smoothed RSSI track, with a running measure of how jumpy it is."""
+    """One RSSI track, averaged over two timescales.
+
+    The fast average is the value the solver uses. The slow one exists only to
+    be compared against it: a beacon that has actually moved holds the two
+    apart, while noise pushes the fast average either side of the slow one and
+    cancels. That difference is the motion signal, and it costs one float.
+    """
 
     rssi: float
+    slow: float = 0.0
     samples: int = 0
-    spread: float = 0.0
     updated: float = field(default_factory=time.monotonic)
 
+    def __post_init__(self) -> None:
+        if not self.slow:
+            self.slow = self.rssi
+
     def update(self, rssi: float, smoothing: float) -> None:
-        # Mean absolute deviation, smoothed the same way as the value itself.
-        # A beacon sitting still varies by the radio noise floor; one being
-        # carried around swings far wider, and it is the wide ones that poison
-        # a solve which assumes everything is stationary.
-        deviation = abs(rssi - self.rssi)
-        self.spread = smoothing * deviation + (1 - smoothing) * self.spread
         self.rssi = smoothing * rssi + (1 - smoothing) * self.rssi
+        self.slow = (
+            RECORDER_SLOW_SMOOTHING * rssi
+            + (1 - RECORDER_SLOW_SMOOTHING) * self.slow
+        )
         self.samples += 1
         self.updated = time.monotonic()
+
+    @property
+    def drift(self) -> float:
+        """How far the recent average has moved away from the long-run one."""
+        return self.rssi - self.slow
 
 
 class SignalRecorder:
@@ -132,34 +146,58 @@ class SignalRecorder:
         """Seconds of data collected so far."""
         return 0.0 if self.started is None else time.monotonic() - self.started
 
-    def observations(
-        self, sources: list[str], stable_only: bool = True
-    ) -> dict[str, dict[str, float]]:
+    def observations(self, sources: list[str]) -> dict[str, dict[str, float]]:
         """anchor -> {beacon address: smoothed RSSI}, excluding the anchors.
 
-        Beacons whose signal is still settling, or which swing too much to be
-        sitting still, are left out: the solver assumes a static world, so a
-        beacon in someone's pocket drags the layout around with it.
+        Everything with enough readings to mean anything is returned. Beacons
+        are no longer filtered on how jumpy they look, because that measure
+        turned out to track signal strength rather than movement and threw away
+        the best-observed references. Which beacons to trust is decided by
+        weight instead, in quality.py.
         """
         anchor_addresses = set(sources)
-        excluded = self.unstable(sources) if stable_only else set()
         return {
             source: {
                 address: reading.rssi
                 for address, reading in self._readings.get(source, {}).items()
-                if not _matches_any(address, anchor_addresses)
-                and address not in excluded
+                if reading.samples >= BEACON_MIN_SAMPLES
+                and not _matches_any(address, anchor_addresses)
             }
             for source in sources
         }
 
-    def unstable(self, sources: list[str]) -> set[str]:
-        """Beacons too jumpy, or too new, to treat as fixed points."""
-        return {
-            address
-            for address, (spread, samples) in self.stability(sources).items()
-            if samples < BEACON_MIN_SAMPLES or spread > BEACON_MAX_SPREAD_DB
-        }
+    def beacon_quality(self, sources: list[str]) -> dict[str, dict[str, float]]:
+        """beacon address -> the raw evidence about how good a landmark it is.
+
+        `motion` is the RMS gap between the fast and slow averages across every
+        radio hearing the beacon. Averaging rather than taking the worst matters:
+        the previous measure took a maximum across radios, so a beacon heard by
+        six radios scored worse than one heard by a single radio purely because
+        the maximum of more samples is larger.
+
+        `persistence` is how much of the recording the beacon was present for,
+        which is what separates installed kit from things passing through.
+        """
+        expected = max(1.0, self.elapsed / RECORDER_INTERVAL.total_seconds())
+        gathered: dict[str, list[_Reading]] = {}
+        anchor_addresses = set(sources)
+        for source in sources:
+            for address, reading in self._readings.get(source, {}).items():
+                if not _matches_any(address, anchor_addresses):
+                    gathered.setdefault(address, []).append(reading)
+
+        quality = {}
+        for address, readings in gathered.items():
+            drifts = [r.drift for r in readings]
+            motion = math.sqrt(sum(d * d for d in drifts) / len(drifts))
+            samples = max(r.samples for r in readings)
+            quality[address] = {
+                "motion": round(motion, 2),
+                "persistence": round(min(1.0, samples / expected), 3),
+                "samples": samples,
+                "radios": len(readings),
+            }
+        return quality
 
     def direct_links(self, sources: list[str]) -> dict[tuple[str, str], list[float]]:
         """(listener, advertiser) -> smoothed RSSI, for anchors hearing anchors."""
@@ -178,18 +216,6 @@ class SignalRecorder:
     def sample_counts(self, sources: list[str]) -> dict[str, int]:
         """How many beacons each anchor currently has a track for."""
         return {source: len(self._readings.get(source, {})) for source in sources}
-
-    def stability(self, sources: list[str]) -> dict[str, tuple[float, int]]:
-        """beacon address -> (worst spread in dB across radios, sample count)."""
-        result: dict[str, tuple[float, int]] = {}
-        for source in sources:
-            for address, reading in self._readings.get(source, {}).items():
-                spread, samples = result.get(address, (0.0, 0))
-                result[address] = (
-                    max(spread, reading.spread),
-                    max(samples, reading.samples),
-                )
-        return result
 
 
 def _split_mac(value: str) -> tuple[str, int] | None:

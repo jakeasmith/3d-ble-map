@@ -350,7 +350,9 @@ class ThreeDBleMapPanel extends HTMLElement {
   }
 
   _beaconTable(map) {
-    const beacons = map.beacons || [];
+    const beacons = (map.beacons || [])
+      .slice()
+      .sort((a, b) => (b.trust ?? 1) - (a.trust ?? 1) || (b.rssi ?? -127) - (a.rssi ?? -127));
     if (!beacons.length) {
       return `<div class="msg">No beacon is heard by ${MIN_BEACON_RADIOS} radios
         yet, which is the fewest that can fix a point in 3D.</div>`;
@@ -362,9 +364,20 @@ class ThreeDBleMapPanel extends HTMLElement {
         // exceeds its distance to the nearest radio is, in plain terms, only
         // located to "somewhere in the house".
         const vague = beacon.uncertainty_m >= beacon.nearest_m;
+        const trust = beacon.trust ?? 1;
+        const trustClass = trust >= 0.6 ? "ok" : trust >= 0.3 ? "warn" : "bad";
         return `
       <tr>
-        <td>${escapeHtml(beaconLabel(beacon))}</td>
+        <td>${escapeHtml(beaconLabel(beacon))}${
+          beacon.known_device
+            ? ' <span class="pill info" title="Home Assistant manages this device">known</span>'
+            : ""
+        }</td>
+        <td class="num">
+          <span class="pill ${trustClass}" title="${trustTitle(beacon)}">${trust.toFixed(
+            2,
+          )}</span>
+        </td>
         <td class="num">
           <span class="pill ${vague ? "warn" : "ok"}">±${beacon.uncertainty_m} m</span>
         </td>
@@ -382,9 +395,9 @@ class ThreeDBleMapPanel extends HTMLElement {
              Showing the ${BEACON_ROWS} strongest of ${beacons.length} placed.</div>`
         : "";
     return `<table><thead><tr>
-        <th>Beacon</th><th class="num">Uncertainty</th><th>Nearest radio</th>
-        <th>Area</th><th class="num">Radios</th><th class="num">Strongest</th>
-        <th>Address</th>
+        <th>Beacon</th><th class="num">Trust</th><th class="num">Uncertainty</th>
+        <th>Nearest radio</th><th>Area</th><th class="num">Radios</th>
+        <th class="num">Strongest</th><th>Address</th>
       </tr></thead><tbody>${rows}</tbody></table>${more}`;
   }
 
@@ -408,6 +421,7 @@ class ThreeDBleMapPanel extends HTMLElement {
         "Beacons placed",
         `${(map.beacons || []).length} of ${map.tracked_beacons ?? 0}`,
       ],
+      ["Trusted landmarks", `${map.weighted_beacons ?? 0}`],
     ];
     const stats = cards
       .map(
@@ -531,6 +545,7 @@ const STYLES = `
   .ok { background: rgba(76,175,80,.16); color: var(--success-color, #4caf50); }
   .bad { background: rgba(244,67,54,.16); color: var(--error-color, #f44336); }
   .warn { background: rgba(255,167,38,.16); color: var(--warning-color, #ffa726); }
+  .info { background: rgba(3,169,244,.16); color: var(--info-color, #039be5); }
   .count {
     display: inline-block; min-width: 22px; text-align: center; padding: 2px 8px;
     border-radius: 12px; font-size: 12px; line-height: 18px;
@@ -579,6 +594,16 @@ function formatHeardBy(entry) {
 
 function pill(value, yes, no) {
   return `<span class="pill ${value ? "ok" : "bad"}">${value ? yes : no}</span>`;
+}
+
+function trustTitle(beacon) {
+  const bits = [];
+  if (beacon.motion != null) bits.push(`motion ${beacon.motion} dB`);
+  if (beacon.persistence != null)
+    bits.push(`present ${Math.round(beacon.persistence * 100)}% of the recording`);
+  if (beacon.address_kind) bits.push(beacon.address_kind + " address");
+  if (beacon.known_device) bits.push("known to Home Assistant");
+  return bits.join(" · ");
 }
 
 function beaconLabel(beacon) {
