@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from functools import partial
@@ -24,6 +25,7 @@ from .const import (
     MAX_SIGNAL_LIMIT,
     MIN_RECORDING_SECONDS,
     SOLVE_CACHE_SECONDS,
+    SOLVE_SLOW_SECONDS,
     WS_ANCHOR_MAP,
     WS_LIST_ADAPTERS,
     WS_LIST_SIGNALS,
@@ -345,8 +347,20 @@ async def _async_cached_solve(
 ) -> dict[str, Any]:
     """Solve the layout off the event loop, reusing a recent result.
 
-    The solve takes hundreds of milliseconds, which would stall Home Assistant
-    if run inline, and the geometry changes far more slowly than the panel polls.
+    The solve is expensive and the geometry changes far more slowly than the
+    panel polls, so it runs in an executor behind a cache.
+
+    A stale cache alone is not enough. Checking it and then starting a solve is
+    two steps with an await between them, so every request arriving while a
+    solve is running used to miss the cache and start its own. That is fine when
+    a solve is quick and compounding when it is not: this house grew to 8 radios
+    and 67 beacons, the solve outgrew the cache interval, and each poll of an
+    open panel piled another one onto the executor. Home Assistant's supervisor
+    restarts a core that stops answering, and it did -- three times.
+
+    So a solve in flight is recorded as a future and concurrent callers await
+    that instead of starting their own. At most one solve exists at any moment,
+    which makes the pile-up impossible rather than merely unlikely.
     """
     cache = hass.data.setdefault(DOMAIN, {}).setdefault("solve_cache", {})
     key = tuple(ordered)
@@ -359,6 +373,48 @@ async def _async_cached_solve(
         and now - cache.get("at", 0.0) < SOLVE_CACHE_SECONDS
     ):
         return cached
+
+    # Someone is already solving this: wait for their answer instead of
+    # starting a second one.
+    pending = cache.get("pending")
+    if pending is not None and cache.get("pending_key") == key and not pending.done():
+        return await asyncio.shield(pending)
+
+    # The solve is a task rather than a bare await so that a client
+    # disconnecting cannot cancel it out from under everyone waiting on it.
+    # Every caller, this one included, awaits it shielded.
+    task = hass.async_create_task(
+        _async_solve(hass, recorder, ordered, levels, anchors)
+    )
+    cache["pending"] = task
+    cache["pending_key"] = key
+
+    def _finished(done: asyncio.Task) -> None:
+        # Clear the slot from the task's own callback, not from a finally in
+        # whichever caller happened to start it -- that caller may be cancelled
+        # long before the solve finishes.
+        if cache.get("pending") is done:
+            cache["pending"] = None
+            cache["pending_key"] = None
+        if done.cancelled() or done.exception() is not None:
+            return
+        result = done.result()
+        cache.update({"result": result, "key": key, "at": time.monotonic()})
+        if result.get("positions"):
+            cache["positions"] = result["positions"]
+
+    task.add_done_callback(_finished)
+    return await asyncio.shield(task)
+
+
+async def _async_solve(
+    hass: HomeAssistant,
+    recorder: Any,
+    ordered: list[str],
+    levels: dict[str, float],
+    anchors: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Do the actual work. Only ever called with no other solve in flight."""
 
     # Snapshot the recorder on the event loop, then do the arithmetic off it.
     direct = recorder.direct_links(ordered)
@@ -389,6 +445,7 @@ async def _async_cached_solve(
     # Hand the previous layout back to the solver. It competes against the cold
     # search rather than replacing it, so a house that has genuinely changed
     # still gets re-solved from scratch; see WARM_HYSTERESIS in refine.py.
+    started = time.monotonic()
     result = await hass.async_add_executor_job(
         partial(
             geometry.solve_layout,
@@ -396,9 +453,20 @@ async def _async_cached_solve(
             direct,
             observations,
             levels,
-            previous=cache.get("positions"),
+            previous=hass.data[DOMAIN]["solve_cache"].get("positions"),
         )
     )
+    elapsed = time.monotonic() - started
+    result["solve_seconds"] = round(elapsed, 2)
+    if elapsed > SOLVE_SLOW_SECONDS:
+        _LOGGER.warning(
+            "Layout solve took %.1fs for %d radios and %d beacons. It runs off "
+            "the event loop and only one runs at a time, so this is slow rather "
+            "than harmful, but lower MAX_SOLVE_BEACONS if it keeps growing",
+            elapsed,
+            len(ordered),
+            result.get("beacons_used") or 0,
+        )
     result["beacons"] = _describe_beacons(
         result.get("beacons") or [], observations, recorder.names(), anchors,
         evidence, known, weights,
@@ -407,9 +475,6 @@ async def _async_cached_solve(
     result["trust"] = weights
     result["tracked_beacons"] = tracked
 
-    cache.update({"result": result, "key": key, "at": now})
-    if result.get("positions"):
-        cache["positions"] = result["positions"]
     return result
 
 

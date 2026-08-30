@@ -559,6 +559,49 @@ def test_link_weighting() -> bool:
     return ok
 
 
+def test_solve_is_bounded() -> bool:
+    """Solve cost must be a property of the code, not of how many proxies
+    someone owns -- and when the cap bites it must drop the cheapest beacons."""
+    ok = True
+    radios = ["a", "b", "c", "d"]
+    # 200 beacons: the first 50 heard by all four radios, the rest by three.
+    observations = {r: {} for r in radios}
+    for i in range(200):
+        heard = radios if i < 50 else radios[:3]
+        for r in heard:
+            observations[r][f"beacon-{i:03d}"] = -70.0
+    original = refine.MAX_SOLVE_BEACONS
+    try:
+        refine.MAX_SOLVE_BEACONS = 60
+        chosen = refine._shared_beacons(radios, observations)
+        ok &= check(
+            "the cap is enforced",
+            len(chosen) == 60,
+            f"200 usable beacons reduced to {len(chosen)}",
+        )
+        four_radio = {f"beacon-{i:03d}" for i in range(50)}
+        ok &= check(
+            "the best-observed beacons survive",
+            four_radio <= set(chosen),
+            "all 50 beacons heard by 4 radios kept; the k=3 ones, which spend "
+            "every reading pinning themselves, are dropped first",
+        )
+        ok &= check(
+            "the choice is stable between solves",
+            chosen == refine._shared_beacons(radios, observations),
+            "a churning beacon set would defeat the warm start",
+        )
+        refine.MAX_SOLVE_BEACONS = 500
+        ok &= check(
+            "no cap, no change",
+            len(refine._shared_beacons(radios, observations)) == 200,
+            "the cap is a backstop and must not bite in a normal house",
+        )
+    finally:
+        refine.MAX_SOLVE_BEACONS = original
+    return ok
+
+
 def test_edge_cases() -> bool:
     ok = check(
         "too few anchors is an error",
@@ -593,6 +636,7 @@ def main() -> int:
         test_floors_are_physical,
         test_beacon_weighting,
         test_link_weighting,
+        test_solve_is_bounded,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")

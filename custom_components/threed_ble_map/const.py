@@ -53,4 +53,24 @@ BEACON_MIN_WEIGHT = 0.05
 # changes far more slowly than the panel polls.
 SOLVE_CACHE_SECONDS = 15
 
+# Hard ceiling on how many beacons enter the solve, most-heard first.
+#
+# This is a backstop, not the fix. Solve cost grows with radios x beacons and
+# every radio added to a house also admits more beacons past
+# MIN_RADIOS_PER_BEACON, so the two multiply -- but a long solve is only
+# dangerous when solves can overlap, and _async_cached_solve now runs at most
+# one at a time. This bounds the pathological case rather than the normal one.
+#
+# Set at the point where accuracy stops improving, measured on 120 synthetic
+# beacons at realistic noise: 2.71 m at 30, 2.40 at 60, 2.04 at 90, 1.97 at 120
+# and unchanged above. Capping lower would trade real accuracy for a cost
+# problem that the single-flight guard already solves.
+MAX_SOLVE_BEACONS = 120
+
+# Warn when a solve takes longer than this. It runs in an executor, so it does
+# not block the event loop directly, but a solve that outlasts its cache means
+# the next request starts another one, and enough of those starve the pool that
+# other integrations depend on.
+SOLVE_SLOW_SECONDS = 5.0
+
 WS_RAW_OBSERVATIONS = f"{DOMAIN}/raw_observations"

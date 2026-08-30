@@ -34,6 +34,7 @@ import math
 import random
 from typing import Any, Sequence
 
+from .const import MAX_SOLVE_BEACONS
 from .geometry import (
     MAX_DISTANCE_M,
     MIN_DISTANCE_M,
@@ -909,12 +910,29 @@ def _beacon_report(
 def _shared_beacons(
     radios: Sequence[str], observations: dict[str, dict[str, float]]
 ) -> list[str]:
-    """Beacons heard by enough radios to constrain anything."""
+    """Beacons heard by enough radios to constrain anything, best first.
+
+    Capped at MAX_SOLVE_BEACONS. Solve cost grows with radios x beacons and had
+    no ceiling, so adding proxies to a house made every solve more expensive in
+    both factors at once -- eventually overrunning the cache interval, which
+    means the next request starts another solve on top of the last.
+
+    When the cap bites, keep the beacons heard by the most radios. Those are the
+    ones carrying surplus constraint: a beacon heard by k radios spends three of
+    those readings pinning itself, so its contribution to the radios is k - 3,
+    and dropping the k = 3 beacons first costs nothing at all.
+    """
     counts: dict[str, int] = {}
     for radio in radios:
         for beacon in observations.get(radio, {}):
             counts[beacon] = counts.get(beacon, 0) + 1
-    return sorted(b for b, count in counts.items() if count >= MIN_RADIOS_PER_BEACON)
+    usable = [b for b, count in counts.items() if count >= MIN_RADIOS_PER_BEACON]
+    if len(usable) > MAX_SOLVE_BEACONS:
+        # Sort by address as well as count so the choice is stable between
+        # solves; a set that churned would defeat the warm start.
+        usable.sort(key=lambda b: (-counts[b], b))
+        usable = usable[:MAX_SOLVE_BEACONS]
+    return sorted(usable)
 
 
 def _initial_beacon_position(
