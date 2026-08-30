@@ -219,6 +219,56 @@ house. A house with more radios per beacon derives a smaller number.
 The scatter term alone derives 1.7 and buys nothing. The redundancy term is
 where the win is -- the same effect the dof correction addresses one layer up.
 
+### Weak readings are biased, not just noisy
+
+A receiver has a sensitivity limit and does not hear packets below it. So the
+weak readings that do arrive are not a fair sample of what was transmitted --
+they are the ones a favourable fade lifted over the bar. They read stronger than
+the truth, and stronger reads as closer. On the house this was built against,
+**38% of all readings sit below -95 dBm**, inside that region.
+
+The tell is in the histogram. Binned by distance, the residual scatter does not
+grow with range, it *shrinks* -- 9.3 dB in the nearest band against 5.3 dB in the
+farthest. Distant readings are not more precise; their spread is clipped by the
+receiver that could not hear the other half of it.
+
+| distance | mean RSSI | sigma |
+| --- | --- | --- |
+| 0.5 - 6.4 m | -72.6 dBm | 9.28 dB |
+| 6.4 - 10.3 m | -84.9 dBm | 5.64 dB |
+| 10.3 - 14.4 m | -90.9 dBm | 5.99 dB |
+| 14.4 - 18.0 m | -93.3 dBm | 5.47 dB |
+| 18.0 - 22.6 m | -96.3 dBm | 5.37 dB |
+| 22.7 - 44.8 m | -98.4 dBm | 5.25 dB |
+
+This matters because it is a **bias**, and the 1/d^2 term corrects variance. That
+term is right and was never the problem; no weighting scheme fixes a systematic
+offset.
+
+Each radio's limit is read from its own RSSI histogram rather than fixed in the
+source, because it is a property of the receiver: measured at -94 to -98 dBm
+across eight radios of three different kinds, tightly clustered despite entirely
+different placements. Readings below it are weighted at `CENSORED_TRUST`.
+
+| trust | real mean | worst | synthetic mean |
+| --- | --- | --- | --- |
+| 1.0 | 3.91 m | 5.15 m | 1.97 m |
+| **0.5** | **3.47 m** | **4.07 m** | **1.82 m** |
+| 0.25 | 3.11 m | 4.03 m | 2.34 m |
+| 0.1 | 3.12 m | 4.36 m | 2.98 m |
+
+0.5 improves both, with a tighter spread and a better worst case in each. 0.25 is
+tempting and wrong: better on the real house, clearly worse on synthetic, which
+models no receiver floor at all -- there the histogram mode lands mid
+distribution and the rule downweights 44% of perfectly good readings. A constant
+that only helps where the effect it assumes is present is a constant tuned to one
+house.
+
+They are downweighted rather than dropped. Cutting them out of the input takes
+beacons below `MIN_RADIOS_PER_BEACON` and starves a solver already short of
+constraint: over 24 runs the median improved to 2.59 m while the worst case went
+from 5.15 m to **11.70 m**. Same lesson as *Fits better, locates worse* above.
+
 ### Standing still
 
 SMACOF is a local method, and the search used to start cold on every poll. Two
