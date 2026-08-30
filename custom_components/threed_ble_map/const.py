@@ -59,7 +59,9 @@ SOLVE_CACHE_SECONDS = 15
 # every radio added to a house also admits more beacons past
 # MIN_RADIOS_PER_BEACON, so the two multiply -- but a long solve is only
 # dangerous when solves can overlap, and _async_cached_solve now runs at most
-# one at a time. This bounds the pathological case rather than the normal one.
+# one at a time. Measured at 5.3 s for 8 radios and 51 beacons, comfortably
+# inside the cache interval; this bounds the pathological case, not the normal
+# one.
 #
 # Set at the point where accuracy stops improving, measured on 120 synthetic
 # beacons at realistic noise: 2.71 m at 30, 2.40 at 60, 2.04 at 90, 1.97 at 120
@@ -67,10 +69,10 @@ SOLVE_CACHE_SECONDS = 15
 # problem that the single-flight guard already solves.
 MAX_SOLVE_BEACONS = 120
 
-# Warn when a solve takes longer than this. It runs in an executor, so it does
-# not block the event loop directly, but a solve that outlasts its cache means
-# the next request starts another one, and enough of those starve the pool that
-# other integrations depend on.
+# Warn when a solve takes longer than this. It runs in an executor and only one
+# runs at a time, so a slow solve is a stale map rather than a hung core -- but
+# it is the number to watch, because everything that arrives while one is
+# running waits on it.
 SOLVE_SLOW_SECONDS = 5.0
 
 WS_RAW_OBSERVATIONS = f"{DOMAIN}/raw_observations"

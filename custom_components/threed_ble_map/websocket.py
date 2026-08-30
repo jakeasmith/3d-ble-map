@@ -351,12 +351,15 @@ async def _async_cached_solve(
     panel polls, so it runs in an executor behind a cache.
 
     A stale cache alone is not enough. Checking it and then starting a solve is
-    two steps with an await between them, so every request arriving while a
-    solve is running used to miss the cache and start its own. That is fine when
-    a solve is quick and compounding when it is not: this house grew to 8 radios
-    and 67 beacons, the solve outgrew the cache interval, and each poll of an
-    open panel piled another one onto the executor. Home Assistant's supervisor
-    restarts a core that stops answering, and it did -- three times.
+    two steps with an await between them, so every request that arrived during
+    those seconds used to miss the cache and start its own solve.
+
+    Measured on this house: 5.3 s per solve at 8 radios and 51 beacons, against
+    a 15 s cache. So no single solve outran its cache -- the damage came from
+    what arrived *while one was running*. Several open panels, or one panel and
+    a script, land together in that window and each start a full solve on the
+    executor. Enough of those and core stops answering, and Home Assistant's
+    supervisor restarts a core that stops answering. It did, three times.
 
     So a solve in flight is recorded as a future and concurrent callers await
     that instead of starting their own. At most one solve exists at any moment,
@@ -462,10 +465,12 @@ async def _async_solve(
         _LOGGER.warning(
             "Layout solve took %.1fs for %d radios and %d beacons. It runs off "
             "the event loop and only one runs at a time, so this is slow rather "
-            "than harmful, but lower MAX_SOLVE_BEACONS if it keeps growing",
+            "than harmful, but lower MAX_SOLVE_BEACONS if it approaches the "
+            "%ds cache interval",
             elapsed,
             len(ordered),
             result.get("beacons_used") or 0,
+            SOLVE_CACHE_SECONDS,
         )
     result["beacons"] = _describe_beacons(
         result.get("beacons") or [], observations, recorder.names(), anchors,
