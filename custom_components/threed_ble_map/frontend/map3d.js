@@ -313,6 +313,9 @@ export class AnchorScene {
       ...projected,
     ].sort((a, b) => a.depth - b.depth);
 
+    // Dots first, labels after, so a radio drawn later cannot land on top of a
+    // label already written.
+    const labels = [];
     for (const point of everything) {
       const isHovered = this.hovered === point.node.id;
       if (point.node.beacon) {
@@ -326,11 +329,81 @@ export class AnchorScene {
       ctx.lineWidth = 2;
       ctx.strokeStyle = isHovered ? textColor : "rgba(0,0,0,.35)";
       ctx.stroke();
+      labels.push({ point, isHovered });
+    }
+    this._drawNodeLabels(ctx, labels, textColor);
+  }
 
-      ctx.fillStyle = textColor;
+  // Radio names collide as soon as a house has more than a few radios, and they
+  // collide worst exactly where the map is densest. Nearest-to-camera wins its
+  // preferred spot and everything behind it steps up out of the way; a label
+  // with nowhere to go is dropped rather than written over its neighbour, since
+  // two overlapping names are less use than one readable one. Hovering always
+  // wins, so nothing is permanently unreadable.
+  _drawNodeLabels(ctx, labels, textColor) {
+    const LINE = 15;
+    const placed = [];
+    const collides = (box) =>
+      placed.some(
+        (other) =>
+          box.left < other.right &&
+          box.right > other.left &&
+          box.top < other.bottom &&
+          box.bottom > other.top,
+      );
+
+    ctx.textAlign = "center";
+    // Nearest first: `everything` is sorted far-to-near for painting, so the
+    // closest radio is last and gets first claim on its own label position.
+    for (const { point, isHovered } of [...labels].reverse()) {
       ctx.font = `${isHovered ? "600 " : ""}13px sans-serif`;
-      ctx.textAlign = "center";
-      ctx.fillText(point.node.label, point.sx, point.sy - NODE_RADIUS - 8);
+      const width = ctx.measureText(point.node.label).width;
+      const baseY = point.sy - NODE_RADIUS - 8;
+
+      let y = baseY;
+      let box = null;
+      for (let step = 0; step < 6; step += 1) {
+        const candidate = {
+          left: point.sx - width / 2 - 3,
+          right: point.sx + width / 2 + 3,
+          top: y - 12,
+          bottom: y + 3,
+        };
+        if (!collides(candidate)) {
+          box = candidate;
+          break;
+        }
+        y -= LINE;
+      }
+      if (!box) {
+        if (!isHovered) continue;
+        box = {
+          left: point.sx - width / 2 - 3,
+          right: point.sx + width / 2 + 3,
+          top: baseY - 12,
+          bottom: baseY + 3,
+        };
+        y = baseY;
+      }
+      placed.push(box);
+
+      // A thin ground-coloured stroke keeps the name readable where it crosses
+      // the beacon cloud, which is most places.
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(0,0,0,.55)";
+      ctx.strokeText(point.node.label, point.sx, y);
+      ctx.fillStyle = textColor;
+      ctx.fillText(point.node.label, point.sx, y);
+
+      // When a label has been pushed clear of its dot, tie it back.
+      if (y < baseY - 2) {
+        ctx.beginPath();
+        ctx.moveTo(point.sx, y + 4);
+        ctx.lineTo(point.sx, baseY);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "rgba(255,255,255,.25)";
+        ctx.stroke();
+      }
     }
   }
 
