@@ -55,7 +55,8 @@ def _to_metres(x_px: float, y_px: float, floor: str) -> tuple[float, float, floa
 
 TRUTH = {name: _to_metres(*values) for name, values in _ROOMS.items()}
 
-# Anchors may be named differently in Home Assistant over time; match loosely.
+# Anchors may be named differently in Home Assistant over time; list each
+# rename explicitly.
 ALIASES = {
     "BLE Anchor 9fbb0c": "BLE Anchor Garage",
     "BLE Anchor c55180": "BLE Anchor Main Bedroom",
@@ -69,9 +70,9 @@ def resolve(label: str) -> str | None:
         return label
     if label in ALIASES:
         return ALIASES[label]
-    for key in TRUTH:
-        if key.lower().startswith(label.lower()[:12]):
-            return key
+    # An anchor with no surveyed position scores as unknown. Never guess a
+    # nearest namesake: anchor labels share long prefixes, and a wrong match
+    # scores a radio against another room without saying so.
     return None
 
 
