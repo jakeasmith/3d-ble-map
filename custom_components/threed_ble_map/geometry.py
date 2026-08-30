@@ -116,7 +116,7 @@ def solve_layout(
             observations,
             direct_rssi,
             levels,
-            shadowing_db=refined["residual_db"],
+            shadowing_db=_shadowing_sigma(refined),
             beacon_weights=beacon_weights,
         )
         if corrected is not None:
@@ -150,6 +150,42 @@ def solve_layout(
         "refined": refined is not None,
         "error": None,
     }
+
+
+def _shadowing_sigma(refined: dict[str, Any]) -> float:
+    """Estimate the shadowing sigma the layout was actually generated with.
+
+    The bias correction needs the *shadowing* -- how far a reading strays from
+    the path-loss model -- but the only thing measurable after a fit is the
+    residual, which is smaller. A fit spends its parameters absorbing exactly
+    the deviations it is being asked to measure: every beacon carries three free
+    coordinates, so a beacon heard by four radios can move to soak up most of
+    its own shadowing and report almost none.
+
+    That gap is not small here. This house fits 171 parameters against 308
+    observations, leaving 137 degrees of freedom, so the residual understates
+    sigma by sqrt(308/137) = 1.5x. Under-estimating sigma under-corrects the
+    log-normal bias, which is why the map solved 1.74x too large while the
+    correction meant to prevent that was running.
+
+    The unbiased estimator is the textbook one, sigma^2 = RSS/(n - p):
+
+        3 per radio and 3 per beacon for position, minus the 6 rigid motions
+        that no amount of data can pin, plus one gain per radio less the one
+        removed by holding the gains to zero mean.
+
+    It is an approximation. The storey projections in refine.py remove freedom
+    that this does not count, so p is a slight over-estimate and the correction
+    slightly aggressive; MAX_SHADOWING_DB is what stops that running away.
+    """
+    n = refined["observations"]
+    radios = len(refined["positions"])
+    beacons = refined["beacons_used"]
+    p = 3 * (radios + beacons) - 6 + (radios - 1)
+    if n - p <= 1:
+        # Too little redundancy to say anything; the raw residual is all there is.
+        return refined["residual_db"]
+    return refined["residual_db"] * math.sqrt(n / (n - p))
 
 
 def _oriented_beacons(
