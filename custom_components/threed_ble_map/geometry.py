@@ -58,6 +58,7 @@ def solve_layout(
     observations: dict[str, dict[str, float]],
     levels: dict[str, float] | None = None,
     beacon_weights: dict[str, float] | None = None,
+    previous: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Estimate a relative 3D position for each anchor.
 
@@ -68,6 +69,9 @@ def solve_layout(
     levels: anchor id -> building floor level, used only to orient the result.
     beacon_weights: beacon address -> how far to trust it as a fixed landmark,
         from quality.py. Absent or missing entries are trusted fully.
+    previous: the last layout this house solved to, offered back to the refiner
+        as one more starting point so an unchanged house stops jumping between
+        equally-good minima. Ignored unless it covers exactly these anchors.
     """
     if len(anchors) < 3:
         return _empty("At least 3 anchors are needed to estimate a layout.")
@@ -105,9 +109,16 @@ def solve_layout(
     # uses that to undo the log-normal bias, which at a real house's noise level
     # inflates every distance by about 30%. Estimating it from the fit is the
     # only option -- nothing else in the system knows the shadowing figure.
+    warm_seed = None
+    if previous and all(anchor in previous for anchor in anchors):
+        warm_seed = [
+            [previous[a]["x"], previous[a]["y"], previous[a]["z"]] for a in anchors
+        ]
+
     refined = refine_layout(
         anchors, seed, observations, direct_rssi, levels,
         beacon_weights=beacon_weights,
+        warm_seed=warm_seed,
     )
     if refined is not None:
         corrected = refine_layout(
@@ -123,6 +134,7 @@ def solve_layout(
             # shadowing correction above -- nothing else knows these figures
             # until a fit has been run once.
             links_worth=refined["links_worth"],
+            warm_seed=warm_seed,
         )
         if corrected is not None:
             refined = corrected
@@ -155,6 +167,7 @@ def solve_layout(
         "links_worth": refined["links_worth"] if refined else None,
         "floor_penalty_db": refined["floor_penalty_db"] if refined else None,
         "bias_correction": refined["bias_correction"] if refined else None,
+        "reused_previous": bool(refined and refined["reused_previous"]),
         "refined": refined is not None,
         "error": None,
     }
@@ -229,6 +242,7 @@ def _empty(error: str, pairs: list[dict[str, Any]] | None = None) -> dict[str, A
         "links_worth": None,
         "floor_penalty_db": None,
         "bias_correction": None,
+        "reused_previous": False,
         "refined": False,
         "error": error,
     }

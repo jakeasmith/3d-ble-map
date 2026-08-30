@@ -116,6 +116,25 @@ SWEEPS_PER_ROUND = 8
 RESTARTS = 6
 RESTART_JITTER = 0.4
 
+# The previous layout is offered back as one more starting point. It is not a
+# ratchet: the cold multi-restart search still runs in full every solve and can
+# take over whenever it genuinely fits better, so nothing can latch onto a stale
+# answer when a radio actually moves. No release condition is needed because the
+# escape is always running.
+#
+# What it buys is stability. SMACOF is a local method, and two minima a hundredth
+# of a dB apart are indistinguishable as fits but metres apart as layouts, so the
+# best-of-six pick was free to alternate between them and the house visibly
+# jumped. Measured before this: nudging the smoothed RSSI by a quarter of a dB
+# -- less than the recorder smooths away between polls -- moved pairwise
+# distances 1.03 m RMS, and the response was not even monotone in the size of the
+# nudge, which is the signature of minimum-hopping rather than of sensitivity to
+# the data.
+#
+# Hence the margin: keep last solve's answer unless a fresh one beats it by more
+# than this fraction. Ties go to not moving.
+WARM_HYSTERESIS = 0.02
+
 # A floor between transmitter and receiver costs signal that the path-loss model
 # would otherwise book as distance, pushing storeys apart. Measured on a real
 # two-storey house, ignoring it left cross-floor pairs +3.0 m too far apart while
@@ -191,6 +210,7 @@ def refine_layout(
     shadowing_db: float = 0.0,
     beacon_weights: dict[str, float] | None = None,
     links_worth: float = MIN_LINK_TRUST,
+    warm_seed: list[list[float]] | None = None,
 ) -> dict[str, Any] | None:
     """Refine an initial layout, solving per-radio gain at the same time.
 
@@ -250,19 +270,28 @@ def refine_layout(
         links,
     )
 
+    starts: list[tuple[str, list[list[float]]]] = [("cold", seed_points)]
+    if warm_seed is not None and len(warm_seed) == len(radios):
+        starts.append(("warm", [point[:] for point in warm_seed]))
+    for attempt in range(1, RESTARTS):
+        rng = random.Random(attempt)
+        starts.append((
+            "jitter",
+            [
+                [value + rng.gauss(0, RESTART_JITTER * scale) for value in point]
+                for point in seed_points
+            ],
+        ))
+
     best: tuple[
         float, list[list[float]], list[float], float, list[list[float]]
     ] | None = None
-    for attempt in range(RESTARTS):
+    warm_result: tuple[
+        float, list[list[float]], list[float], float, list[list[float]]
+    ] | None = None
+    for attempt, (origin, start) in enumerate(starts):
         rng = random.Random(attempt)
-        points = [
-            point[:]
-            if attempt == 0
-            else [
-                value + rng.gauss(0, RESTART_JITTER * scale) for value in point
-            ]
-            for point in seed_points
-        ]
+        points = [point[:] for point in start]
         gains = [0.0] * len(radios)
         _constrain_storeys(points, storeys)
         beacon_points = _seed_beacons(radios, observations, beacons, points, rng)
@@ -287,14 +316,24 @@ def refine_layout(
         residual = _rms_residual(
             points, beacon_points, gains, readings, links, radio_levels, penalty
         )
+        outcome = (
+            residual,
+            [p[:] for p in points],
+            gains[:],
+            penalty,
+            [b[:] for b in beacon_points],
+        )
         if best is None or residual < best[0]:
-            best = (
-                residual,
-                [p[:] for p in points],
-                gains[:],
-                penalty,
-                [b[:] for b in beacon_points],
-            )
+            best = outcome
+        if origin == "warm":
+            warm_result = outcome
+
+    # Ties go to standing still. A fresh minimum has to be meaningfully better
+    # than where the layout already is before the house is allowed to move.
+    reused = False
+    if warm_result is not None and warm_result[0] <= best[0] * (1 + WARM_HYSTERESIS):
+        best = warm_result
+        reused = True
 
     current, points, gains, penalty, beacon_points = best
     beacon_sigma, link_sigma = _class_sigmas(
@@ -326,7 +365,8 @@ def refine_layout(
         "shadowing_db": round(shadowing_db, 2),
         "bias_correction": round(bias, 3),
         "floor_penalty_db": round(penalty, 1),
-        "restarts": RESTARTS,
+        "restarts": len(starts),
+        "reused_previous": reused,
     }
 
 

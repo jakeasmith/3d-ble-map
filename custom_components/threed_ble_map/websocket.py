@@ -386,8 +386,18 @@ async def _async_cached_solve(
     #
     # solve_layout still accepts weights and the path is tested, so this is one
     # argument away if better evidence turns up.
+    # Hand the previous layout back to the solver. It competes against the cold
+    # search rather than replacing it, so a house that has genuinely changed
+    # still gets re-solved from scratch; see WARM_HYSTERESIS in refine.py.
     result = await hass.async_add_executor_job(
-        partial(geometry.solve_layout, ordered, direct, observations, levels)
+        partial(
+            geometry.solve_layout,
+            ordered,
+            direct,
+            observations,
+            levels,
+            previous=cache.get("positions"),
+        )
     )
     result["beacons"] = _describe_beacons(
         result.get("beacons") or [], observations, recorder.names(), anchors,
@@ -398,6 +408,8 @@ async def _async_cached_solve(
     result["tracked_beacons"] = tracked
 
     cache.update({"result": result, "key": key, "at": now})
+    if result.get("positions"):
+        cache["positions"] = result["positions"]
     return result
 
 
