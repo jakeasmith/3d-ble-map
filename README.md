@@ -394,12 +394,18 @@ MIT
 Frontend and backend iterate very differently, and knowing which is which saves
 a lot of waiting.
 
-**Frontend (`frontend/*.js`) needs no restart.** The files are read from disk per
-request, so copying a new one over is the whole deploy. The browser is the part
-that needs convincing: the panel's module URL carries a cache-busting token
-fixed at registration, so it does not change when you edit a file. Clicking
-through the sidebar is client-side routing and re-uses the cached module; a plain
-reload usually does too. Use **Ctrl/Cmd-Shift-R** to bypass the cache.
+**Frontend (`frontend/*.js`) needs a restart too, despite appearances.** The
+files are read from disk per request, so the copy really is the whole deploy on
+the server side. The browser is the problem. The panel's module URL carries a
+cache-busting token computed in `_module_version` when the panel is *registered*,
+which happens once during setup -- so editing a bundle afterwards leaves the URL
+byte-for-byte identical and the browser keeps serving the module it already has.
+Ctrl/Cmd-Shift-R does not reliably shift it, and a config-entry reload does not
+help either: it returns `require_restart: true` without re-registering the panel,
+so the token stays put. Verified by watching `?v=` stay unchanged across both.
+
+Restarting is what updates the token. Budget for it, or expect to debug a change
+that is already on disk and simply is not being loaded.
 
 **Backend (`*.py`) needs a restart.** Python caches modules in `sys.modules`, and
 reloading the config entry re-runs setup without re-importing. There is no
