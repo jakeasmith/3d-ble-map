@@ -101,6 +101,8 @@ def solve_layout(
     # against the raw observations, solving each radio's gain at the same time.
     from .refine import refine_layout
 
+    floors = _censor_floors(anchors, observations)
+
     seed = {
         anchor: {"x": p[0], "y": p[1], "z": p[2]}
         for anchor, p in zip(anchors, coords)
@@ -119,6 +121,7 @@ def solve_layout(
         anchors, seed, observations, direct_rssi, levels,
         beacon_weights=beacon_weights,
         warm_seed=warm_seed,
+        censor_floors=floors,
     )
     if refined is not None:
         corrected = refine_layout(
@@ -135,6 +138,7 @@ def solve_layout(
             # until a fit has been run once.
             links_worth=refined["links_worth"],
             warm_seed=warm_seed,
+            censor_floors=floors,
         )
         if corrected is not None:
             refined = corrected
@@ -171,6 +175,46 @@ def solve_layout(
         "refined": refined is not None,
         "error": None,
     }
+
+
+# A radio needs this many readings before the shape of its own RSSI histogram
+# means anything.
+MIN_READINGS_FOR_FLOOR = 20
+
+
+def _censor_floors(
+    anchors: Sequence[str], observations: dict[str, dict[str, float]]
+) -> list[float] | None:
+    """Estimate, per radio, the RSSI below which its readings stop being fair.
+
+    A receiver has a sensitivity limit. Packets weaker than it are not heard at
+    all, so the weak readings that do arrive are the ones a favourable fade
+    lifted over the bar -- biased strong, and read as closer than true.
+
+    The limit shows up as the mode of the radio's own RSSI histogram: an
+    uncensored population tails off smoothly, while a censored one piles up
+    against the wall and then cliffs. Measured here the mode sits at -94 to
+    -98 dBm across eight radios of three different kinds, tightly clustered
+    despite completely different placements, which is what makes it a property
+    of the receivers rather than of where they happen to sit.
+
+    Taking it from each radio's own data rather than fixing a number keeps this
+    working on hardware with a different sensitivity -- and on synthetic data,
+    which models no receiver floor at all and where the mode lands mid-histogram
+    with a long tail below it.
+    """
+    floors = []
+    for anchor in anchors:
+        values = list(observations.get(anchor, {}).values())
+        if len(values) < MIN_READINGS_FOR_FLOOR:
+            floors.append(-999.0)
+            continue
+        histogram: dict[int, int] = {}
+        for value in values:
+            bucket = int(value // 2) * 2
+            histogram[bucket] = histogram.get(bucket, 0) + 1
+        floors.append(float(max(histogram, key=lambda b: (histogram[b], b))))
+    return floors if any(f > -999.0 for f in floors) else None
 
 
 def _shadowing_sigma(refined: dict[str, Any]) -> float:

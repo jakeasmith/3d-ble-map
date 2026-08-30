@@ -602,6 +602,57 @@ def test_solve_is_bounded() -> bool:
     return ok
 
 
+def test_weak_readings() -> bool:
+    """A radio's own histogram must locate its sensitivity limit, and the rule
+    must not fire on data that has no limit to find."""
+    ok = True
+    radios = ["a", "b"]
+    # `a` is censored: readings pile up against a wall at -96 and stop.
+    # `b` is not: a smooth spread with a long weak tail, as synthetic data has.
+    censored = {f"x{i}": v for i, v in enumerate(
+        [-60.0, -70.0, -80.0] + [-96.0] * 20 + [-98.0] * 6 + [-100.0] * 2
+    )}
+    smooth = {f"y{i}": float(-60 - i) for i in range(40)}
+    floors = geometry._censor_floors(radios, {"a": censored, "b": smooth})
+
+    ok &= check(
+        "the censored radio's limit is found",
+        floors[0] == -96.0,
+        f"mode of a piled-up histogram is {floors[0]} dBm, where the readings stop",
+    )
+    # What separates the two is where the mode sits relative to the weakest
+    # thing the radio heard. Piled against a wall, they are close together;
+    # spread over a range, the mode is far above the tail.
+    censored_gap = floors[0] - min(censored.values())
+    smooth_gap = floors[1] - min(smooth.values())
+    ok &= check(
+        "a censored histogram piles up against its limit",
+        censored_gap <= 6,
+        f"mode sits {censored_gap:.0f} dB above the weakest reading",
+    )
+    ok &= check(
+        "a smooth one does not",
+        smooth_gap > 20,
+        f"mode sits {smooth_gap:.0f} dB above the weakest reading, so the weak "
+        "end is a genuine tail and not a wall -- this is the synthetic case, "
+        "which models no receiver floor",
+    )
+    ok &= check(
+        "weak readings are leaned on, not discarded",
+        0.0 < refine.CENSORED_TRUST < 1.0,
+        f"trust is {refine.CENSORED_TRUST}: dropping them outright starves a "
+        "solver that is already short of constraint, and sent the worst case "
+        "from 5.15 m to 11.70 m when tried",
+    )
+    ok &= check(
+        "too little data means no filtering at all",
+        geometry._censor_floors(["a"], {"a": {"one": -80.0}}) is None,
+        "under 20 readings a histogram has no shape to read, so the whole "
+        "mechanism switches off rather than guessing a floor",
+    )
+    return ok
+
+
 def test_edge_cases() -> bool:
     ok = check(
         "too few anchors is an error",
@@ -637,6 +688,7 @@ def main() -> int:
         test_beacon_weighting,
         test_link_weighting,
         test_solve_is_bounded,
+        test_weak_readings,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")

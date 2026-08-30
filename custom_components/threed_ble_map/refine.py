@@ -103,6 +103,42 @@ MAX_SHADOWING_DB = 12.0
 # ratio came out at 2.1, close enough that hard-coding either would be tuning to
 # one house. The bounds only stop a degenerate fit running away -- with 18 links
 # against 290 readings the ratio is estimated from few residuals.
+# How much a reading near the weak end of a radio's own range is worth.
+#
+# The motivating effect is censoring. A receiver has a sensitivity limit and
+# simply does not hear packets below it, so the weak readings that do arrive are
+# the ones a favourable fade lifted over the bar. They are biased strong, and
+# biased strong reads as closer than true. On this house 38% of all readings sit
+# below -95 dBm, in that region. Bias is not variance, so no amount of 1/d^2
+# weighting corrects it.
+#
+# Discarding them is worse than leaning on them less. This solver is
+# constraint-starved -- the same reason downweighting suspect beacons and
+# solving per-beacon transmit power both failed -- and a hard cut on the raw
+# input drops beacons below MIN_RADIOS_PER_BEACON entirely, which sent the worst
+# case over 24 runs from 5.15 m to 11.70 m even as the median improved.
+#
+# Measured over 24 runs on a real capture and 8 seeds of synthetic:
+#
+#     trust    real mean   worst    synthetic mean
+#     1.0        3.91 m    5.15 m       1.97 m
+#     0.5        3.47 m    4.07 m       1.82 m
+#     0.25       3.11 m    4.03 m       2.34 m
+#     0.1        3.12 m    4.36 m       2.98 m
+#
+# 0.25 is better on the real house and clearly worse on synthetic, because
+# synthetic models no receiver floor at all: the histogram mode lands mid
+# distribution there and the rule downweights 44% of perfectly good readings. A
+# constant that only helps where the effect it assumes is present is a constant
+# tuned to one house.
+#
+# 0.5 improves both -- real by 11%, synthetic by 8%, with a tighter spread and a
+# better worst case in each. It also asserts less: not "these are censored,
+# ignore them" but "lean on the weakest half of a radio's range less", which is
+# true whether or not a receiver floor is in play, since those are also the long
+# links where the path-loss model is furthest from reality.
+CENSORED_TRUST = 0.5
+
 MIN_LINK_TRUST = 1.0
 MAX_LINK_TRUST = 6.0
 
@@ -212,6 +248,7 @@ def refine_layout(
     beacon_weights: dict[str, float] | None = None,
     links_worth: float = MIN_LINK_TRUST,
     warm_seed: list[list[float]] | None = None,
+    censor_floors: list[float] | None = None,
 ) -> dict[str, Any] | None:
     """Refine an initial layout, solving per-radio gain at the same time.
 
@@ -309,7 +346,7 @@ def refine_layout(
                 _majorize(
                     points, beacon_points, gains, readings, links,
                     floor_groups, bias, radio_levels, penalty,
-                    weights_by_beacon, links_worth,
+                    weights_by_beacon, links_worth, censor_floors,
                 )
                 _constrain_storeys(points, storeys)
                 _constrain_beacons(beacon_points, points, storeys)
@@ -553,6 +590,7 @@ def _majorize(
     floor_penalty: float = 0.0,
     beacon_weights: list[float] | None = None,
     links_worth: float = 1.0,
+    censor_floors: list[float] | None = None,
 ) -> None:
     """One SMACOF sweep: move every point to where its springs want it.
 
@@ -580,6 +618,8 @@ def _majorize(
         if rest is None:
             continue
         trust = beacon_weights[beacon] if beacon_weights else 1.0
+        if censor_floors is not None and observed < censor_floors[radio]:
+            trust *= CENSORED_TRUST
         _pull(
             points[radio], beacon_points[beacon], rest,
             targets[radio], weights, radio, trust,
