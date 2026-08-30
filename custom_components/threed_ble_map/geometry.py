@@ -118,6 +118,11 @@ def solve_layout(
             levels,
             shadowing_db=_shadowing_sigma(refined),
             beacon_weights=beacon_weights,
+            # The first pass measures how far each kind of observation actually
+            # scatters; the second weights them by it. Same shape as the
+            # shadowing correction above -- nothing else knows these figures
+            # until a fit has been run once.
+            links_worth=refined["links_worth"],
         )
         if corrected is not None:
             refined = corrected
@@ -145,6 +150,9 @@ def solve_layout(
         "residual_db": refined["residual_db"] if refined else None,
         "beacons_used": refined["beacons_used"] if refined else 0,
         "shadowing_db": refined["shadowing_db"] if refined else None,
+        "beacon_sigma_db": refined["beacon_sigma_db"] if refined else None,
+        "link_sigma_db": refined["link_sigma_db"] if refined else None,
+        "links_worth": refined["links_worth"] if refined else None,
         "floor_penalty_db": refined["floor_penalty_db"] if refined else None,
         "bias_correction": refined["bias_correction"] if refined else None,
         "refined": refined is not None,
@@ -216,6 +224,9 @@ def _empty(error: str, pairs: list[dict[str, Any]] | None = None) -> dict[str, A
         "residual_db": None,
         "beacons_used": 0,
         "shadowing_db": None,
+        "beacon_sigma_db": None,
+        "link_sigma_db": None,
+        "links_worth": None,
         "floor_penalty_db": None,
         "bias_correction": None,
         "refined": False,

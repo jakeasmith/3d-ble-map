@@ -89,6 +89,22 @@ MIN_SEPARATION_M = 0.3
 # would shrink the map instead.
 MAX_SHADOWING_DB = 12.0
 
+# A radio-to-radio link and a beacon reading are not the same measurement, and
+# the objective was treating them as if they were. Weighting every observation
+# by 1/d^2 is the maximum-likelihood choice only when they all share one sigma;
+# they do not. A link has no unknown transmit power, both ends are mains-powered
+# and cannot walk off, and it is averaged over two directions -- measured on this
+# house it scatters 5.8 dB against 8.5 dB for a beacon reading.
+#
+# Generalised least squares says weight by 1/sigma^2, so the ratio of the two
+# variances is the link's weight. That figure is measured from each fit rather
+# than fixed here: an empirical sweep on one capture liked 3.0 and the measured
+# ratio came out at 2.1, close enough that hard-coding either would be tuning to
+# one house. The bounds only stop a degenerate fit running away -- with 18 links
+# against 290 readings the ratio is estimated from few residuals.
+MIN_LINK_TRUST = 1.0
+MAX_LINK_TRUST = 6.0
+
 ROUNDS = 40
 SWEEPS_PER_ROUND = 8
 
@@ -174,6 +190,7 @@ def refine_layout(
     levels: dict[str, float] | None = None,
     shadowing_db: float = 0.0,
     beacon_weights: dict[str, float] | None = None,
+    links_worth: float = MIN_LINK_TRUST,
 ) -> dict[str, Any] | None:
     """Refine an initial layout, solving per-radio gain at the same time.
 
@@ -262,7 +279,7 @@ def refine_layout(
                 _majorize(
                     points, beacon_points, gains, readings, links,
                     floor_groups, bias, radio_levels, penalty,
-                    weights_by_beacon,
+                    weights_by_beacon, links_worth,
                 )
                 _constrain_storeys(points, storeys)
                 _constrain_beacons(beacon_points, points, storeys)
@@ -280,6 +297,10 @@ def refine_layout(
             )
 
     current, points, gains, penalty, beacon_points = best
+    beacon_sigma, link_sigma = _class_sigmas(
+        points, beacon_points, gains, readings, links, radio_levels, penalty
+    )
+    radios_per_beacon = len(readings) / len(beacons) if beacons else 0.0
 
     if current >= baseline:
         # Refinement is an optimisation, not an article of faith. If it did not
@@ -296,6 +317,11 @@ def refine_layout(
         "residual_db": round(current, 2),
         "seed_residual_db": round(baseline, 2),
         "beacons_used": len(beacons),
+        "beacon_sigma_db": round(beacon_sigma, 2),
+        "link_sigma_db": round(link_sigma, 2),
+        "links_worth": round(
+            link_trust(beacon_sigma, link_sigma, radios_per_beacon), 2
+        ),
         "observations": len(readings) + len(links),
         "shadowing_db": round(shadowing_db, 2),
         "bias_correction": round(bias, 3),
@@ -485,6 +511,7 @@ def _majorize(
     radio_levels: list[float | None] | None = None,
     floor_penalty: float = 0.0,
     beacon_weights: list[float] | None = None,
+    links_worth: float = 1.0,
 ) -> None:
     """One SMACOF sweep: move every point to where its springs want it.
 
@@ -534,8 +561,14 @@ def _majorize(
         )
         if rest is None:
             continue
-        _pull(points[listener], points[advertiser], rest, targets[listener], weights, listener)
-        _pull(points[advertiser], points[listener], rest, targets[advertiser], weights, advertiser)
+        _pull(
+            points[listener], points[advertiser], rest,
+            targets[listener], weights, listener, links_worth,
+        )
+        _pull(
+            points[advertiser], points[listener], rest,
+            targets[advertiser], weights, advertiser, links_worth,
+        )
 
     # Radios on one storey are at the same height. Pull each towards its floor's
     # mean as a spring alongside the observations. _constrain_storeys applies the
@@ -670,6 +703,80 @@ def _solve_gains(
     # indistinguishable from scaling every distance.
     mean_gain = sum(updated) / len(updated)
     return [value - mean_gain for value in updated]
+
+
+def _class_sigmas(
+    points, beacon_points, gains, readings, links,
+    radio_levels=None, floor_penalty=0.0,
+):
+    """RMS dB residual of beacon readings and of direct links, separately."""
+    levels = radio_levels or [None] * len(points)
+    beacon_levels = (
+        _beacon_levels(beacon_points, points, levels)
+        if floor_penalty
+        else [None] * len(beacon_points)
+    )
+    beacon_sq = []
+    for radio, beacon, observed in readings:
+        distance = max(
+            MIN_SEPARATION_M, math.dist(points[radio], beacon_points[beacon])
+        )
+        predicted = (
+            TX_POWER_AT_1M
+            + gains[radio]
+            - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+            - floor_penalty * _floors_apart(levels[radio], beacon_levels[beacon])
+        )
+        beacon_sq.append((observed - predicted) ** 2)
+
+    link_sq = []
+    for listener, advertiser, observed in links:
+        distance = max(
+            MIN_SEPARATION_M, math.dist(points[listener], points[advertiser])
+        )
+        predicted = (
+            TX_POWER_AT_1M
+            + gains[listener]
+            + gains[advertiser]
+            - 10 * PATH_LOSS_EXPONENT * math.log10(distance)
+            - floor_penalty * _floors_apart(levels[listener], levels[advertiser])
+        )
+        link_sq.append((observed - predicted) ** 2)
+
+    def rms(values):
+        return math.sqrt(sum(values) / len(values)) if values else 0.0
+
+    return rms(beacon_sq), rms(link_sq)
+
+
+def link_trust(
+    beacon_sigma: float, link_sigma: float, radios_per_beacon: float
+) -> float:
+    """How much more a direct link is worth than a beacon reading.
+
+    Two independent reasons, multiplied, both measured rather than chosen.
+
+    A link scatters less. No unknown transmit power, both ends mains-powered
+    and immobile, and it is averaged over two directions. Generalised least
+    squares weights by 1/sigma^2, so the variance ratio is the first factor --
+    about 1.7 on this house.
+
+    A beacon reading is also worth less than it looks, which is the larger
+    effect. A beacon carries its own three unknown coordinates, so of the k
+    readings it contributes, three are spent pinning the beacon itself and only
+    k - 3 say anything about where the radios are. At k = 5.8 that is 2.8 of
+    5.8, a factor of 2.1. A link spends nothing: both of its endpoints are
+    already in the solve.
+
+    Together they derive ~3.5 on this capture. An empirical sweep independently
+    liked 3.0, which is the agreement worth having -- the constant is computed
+    from each fit, so a house with more radios per beacon gets a smaller one.
+    """
+    if link_sigma <= 0 or beacon_sigma <= 0 or radios_per_beacon <= 3:
+        return MIN_LINK_TRUST
+    scatter = (beacon_sigma / link_sigma) ** 2
+    redundancy = radios_per_beacon / (radios_per_beacon - 3)
+    return max(MIN_LINK_TRUST, min(MAX_LINK_TRUST, scatter * redundancy))
 
 
 def _median(values: list[float]) -> float:

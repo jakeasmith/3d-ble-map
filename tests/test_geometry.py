@@ -520,6 +520,45 @@ def test_beacon_weighting() -> bool:
     return ok
 
 
+def test_link_weighting() -> bool:
+    """A direct link must count for more than a beacon reading, by how much the
+    two actually differ -- never by a constant someone picked."""
+    ok = True
+    trust = refine.link_trust
+
+    ok &= check(
+        "a cleaner link is worth more",
+        trust(8.5, 5.8, 5.8) > trust(8.5, 8.5, 5.8),
+        f"link at 5.8 dB scores {trust(8.5, 5.8, 5.8):.2f} against "
+        f"{trust(8.5, 8.5, 5.8):.2f} when it scatters as much as a beacon",
+    )
+    ok &= check(
+        "beacons heard by more radios need less help",
+        trust(8.5, 5.8, 9.0) < trust(8.5, 5.8, 4.5),
+        f"k=9 gives {trust(8.5, 5.8, 9.0):.2f}, k=4.5 gives "
+        f"{trust(8.5, 5.8, 4.5):.2f} -- a beacon spends 3 readings on itself "
+        "either way, so the surplus grows with k",
+    )
+    ok &= check(
+        "an exactly-determined beacon cannot be leaned on",
+        trust(8.5, 5.8, 3.0) == refine.MIN_LINK_TRUST,
+        "at k=3 a beacon contributes no surplus at all; the ratio is undefined "
+        "and must not divide by zero",
+    )
+    ok &= check(
+        "the weight stays bounded",
+        trust(40.0, 0.5, 3.2) <= refine.MAX_LINK_TRUST,
+        f"a degenerate fit derives {trust(40.0, 0.5, 3.2):.2f}, held at the cap "
+        f"of {refine.MAX_LINK_TRUST}",
+    )
+    ok &= check(
+        "no link advantage when nothing separates them",
+        trust(7.0, 7.0, 6.0) > 1.0,
+        f"equal scatter still leaves the redundancy term: {trust(7.0, 7.0, 6.0):.2f}",
+    )
+    return ok
+
+
 def test_edge_cases() -> bool:
     ok = check(
         "too few anchors is an error",
@@ -553,6 +592,7 @@ def main() -> int:
         test_places_beacons,
         test_floors_are_physical,
         test_beacon_weighting,
+        test_link_weighting,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")
