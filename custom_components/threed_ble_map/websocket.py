@@ -277,12 +277,19 @@ async def ws_anchor_map(
     connection.send_result(msg["id"], await async_build_map(hass))
 
 
-async def async_build_map(hass: HomeAssistant) -> dict[str, Any]:
+async def async_build_map(hass: HomeAssistant, wait: bool = True) -> dict[str, Any]:
     """The whole map, as the panel wants it.
 
     Shared by the one-shot command and by the background publisher, so a client
     that subscribes and a client that asks are looking at the same thing built
     the same way.
+
+    `wait` is what separates them. Somebody who asked is owed an answer and can
+    wait the seconds a first solve takes. The publisher is on a five-second
+    clock and must not: waiting made it skip two ticks out of every five, so the
+    map froze for twelve seconds each time the layout was re-solved -- the exact
+    stall this path exists to remove. It publishes the tracked map against the
+    frame it already has and lets the solve land whenever it lands.
     """
     recorder = hass.data.get(DOMAIN, {}).get("recorder")
     if recorder is None:
@@ -336,7 +343,7 @@ async def async_build_map(hass: HomeAssistant) -> dict[str, Any]:
     else:
         by_source = {anchor["source"]: anchor for anchor in anchors}
         result = await _async_cached_solve(
-            hass, recorder, ordered, levels, by_source
+            hass, recorder, ordered, levels, by_source, wait=wait
         )
         result = _track_beacons(hass, recorder, result, by_source)
 
@@ -467,7 +474,7 @@ def async_start_publisher(hass: HomeAssistant) -> Any:
 
         data["publishing"] = True
         try:
-            payload = await async_build_map(hass)
+            payload = await async_build_map(hass, wait=False)
         except Exception:  # pragma: no cover - a publisher must not die
             _LOGGER.exception("Failed to build the map for subscribers")
             return
@@ -486,6 +493,7 @@ async def _async_cached_solve(
     ordered: list[str],
     levels: dict[str, float],
     anchors: dict[str, dict[str, Any]],
+    wait: bool = True,
 ) -> dict[str, Any]:
     """Solve the layout off the event loop, reusing a recent result.
 
@@ -523,6 +531,8 @@ async def _async_cached_solve(
     # starting a second one.
     pending = cache.get("pending")
     if pending is not None and cache.get("pending_key") == key and not pending.done():
+        if not wait and cached is not None:
+            return cached
         return await asyncio.shield(pending)
 
     # The solve is a task rather than a bare await so that a client
@@ -549,6 +559,10 @@ async def _async_cached_solve(
             cache["positions"] = result["positions"]
 
     task.add_done_callback(_finished)
+    if not wait and cached is not None:
+        # A solve is now on its way. Hand back the layout we already have rather
+        # than holding up an update the tracker has already made current.
+        return cached
     return await asyncio.shield(task)
 
 
@@ -625,11 +639,25 @@ async def _async_solve(
     # it is already in the frame the panel is shown.
     cache = hass.data[DOMAIN]["solve_cache"]
     cache["frame"] = tracking.frame_from(result, levels)
-    cache["tracked"] = {
-        beacon["address"]: {axis: beacon[axis] for axis in ("x", "y", "z")}
-        for beacon in (result.get("beacons") or [])
-        if "x" in beacon
-    }
+
+    # Adopt this solve's beacons only where nothing is tracking them yet.
+    #
+    # Replacing them all was tried and is visibly wrong: the radios take three
+    # percent of each new solve, so a beacon handed the solve's answer whole is
+    # placed against a frame the radios have barely moved towards. Measured
+    # live, beacons jumped a median of 1.9 m and as much as 48 m on the tick a
+    # solve landed, which is the contortion calibration exists to prevent,
+    # relocated from the radios to the beacons.
+    #
+    # Carrying them through the same transform keeps them in step, and the
+    # tracker walks them onto the new frame over the next few ticks.
+    tracked = dict(cache.get("tracked") or {})
+    for beacon in result.get("beacons") or []:
+        if "x" in beacon and beacon["address"] not in tracked:
+            tracked[beacon["address"]] = {
+                axis: beacon[axis] for axis in ("x", "y", "z")
+            }
+    cache["tracked"] = tracked
 
     return result
 
@@ -685,6 +713,13 @@ def _apply_calibration(hass: HomeAssistant, result: dict[str, Any]) -> None:
 
     cache["calibrated"] = calibrated
     cache["solves"] = solves + 1
+    # The tracked beacons live in the published frame, so they have to travel
+    # with it exactly as the solve's own beacons do.
+    if tracked := cache.get("tracked"):
+        cache["tracked"] = {
+            address: calibration.apply(transform, point)
+            for address, point in tracked.items()
+        }
 
     result["positions"] = {
         anchor: {axis: round(value, 2) for axis, value in point.items()}
