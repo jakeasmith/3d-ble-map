@@ -110,3 +110,18 @@ CALIBRATION_RATE = 0.03
 SOLVE_TIMEOUT_SECONDS = 120.0
 
 WS_RAW_OBSERVATIONS = f"{DOMAIN}/raw_observations"
+
+WS_SUBSCRIBE = f"{DOMAIN}/subscribe"
+
+# How often the map is recomputed and pushed to whoever is watching. Matched to
+# the recorder's own sampling interval: the readings underneath cannot change
+# faster than they are taken, so publishing faster would only resend the same
+# numbers.
+LIVE_INTERVAL = timedelta(seconds=5)
+
+# With nobody watching, a full solve still runs this often. Not for the map --
+# there is nobody to show it to -- but because calibration only advances when a
+# solve happens, so a house that is never looked at would show a cold, unsettled
+# layout the moment someone opened the panel. Five minutes keeps it converging
+# for about one percent of a core.
+IDLE_SOLVE_SECONDS = 300

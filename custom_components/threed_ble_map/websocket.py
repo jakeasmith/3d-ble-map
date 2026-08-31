@@ -32,7 +32,11 @@ from .const import (
     WS_LIST_ADAPTERS,
     WS_LIST_SIGNALS,
     WS_RAW_OBSERVATIONS,
+    WS_SUBSCRIBE,
+    LIVE_INTERVAL,
+    IDLE_SOLVE_SECONDS,
 )
+from homeassistant.helpers.event import async_track_time_interval
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +48,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_list_signals)
     websocket_api.async_register_command(hass, ws_anchor_map)
     websocket_api.async_register_command(hass, ws_raw_observations)
+    websocket_api.async_register_command(hass, ws_subscribe)
 
 
 @websocket_api.require_admin
@@ -269,21 +274,27 @@ async def ws_anchor_map(
     msg: dict[str, Any],
 ) -> None:
     """Estimate where each anchor sits in 3D, relative to the others."""
+    connection.send_result(msg["id"], await async_build_map(hass))
+
+
+async def async_build_map(hass: HomeAssistant) -> dict[str, Any]:
+    """The whole map, as the panel wants it.
+
+    Shared by the one-shot command and by the background publisher, so a client
+    that subscribes and a client that asks are looking at the same thing built
+    the same way.
+    """
     recorder = hass.data.get(DOMAIN, {}).get("recorder")
     if recorder is None:
-        connection.send_result(
-            msg["id"],
-            {
-                "anchors": [],
-                "positions": {},
-                "pairs": [],
-                "stress": None,
-                "elapsed": 0,
-                "ready": False,
-                "error": "The signal recorder is not running.",
-            },
-        )
-        return
+        return {
+            "anchors": [],
+            "positions": {},
+            "pairs": [],
+            "stress": None,
+            "elapsed": 0,
+            "ready": False,
+            "error": "The signal recorder is not running.",
+        }
 
     device_reg = dr.async_get(hass)
     area_reg = ar.async_get(hass)
@@ -329,16 +340,13 @@ async def ws_anchor_map(
         )
         result = _track_beacons(hass, recorder, result, by_source)
 
-    connection.send_result(
-        msg["id"],
-        {
-            "anchors": anchors,
-            "elapsed": elapsed,
-            "ready": ready,
-            "min_seconds": MIN_RECORDING_SECONDS,
-            **result,
-        },
-    )
+    return {
+        "anchors": anchors,
+        "elapsed": elapsed,
+        "ready": ready,
+        "min_seconds": MIN_RECORDING_SECONDS,
+        **result,
+    }
 
 
 def _track_beacons(
@@ -395,6 +403,81 @@ def _track_beacons(
         )
     beacons.sort(key=lambda beacon: -(beacon["rssi"] or -127))
     return {**result, "beacons": beacons, "beacons_tracked": True}
+
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): WS_SUBSCRIBE})
+@websocket_api.async_response
+async def ws_subscribe(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Push the map to this client as it changes, instead of being asked.
+
+    Polling put a request on the wire every few seconds whether anything had
+    moved or not, and still delivered each update somewhere between zero and one
+    poll late. Subscribing costs nothing while the house is still and delivers
+    the moment there is something to deliver.
+    """
+    listeners = hass.data.setdefault(DOMAIN, {}).setdefault("listeners", {})
+    key = (id(connection), msg["id"])
+
+    @callback
+    def unsubscribe() -> None:
+        listeners.pop(key, None)
+
+    @callback
+    def send(payload: dict[str, Any]) -> None:
+        connection.send_message(websocket_api.event_message(msg["id"], payload))
+
+    connection.subscriptions[msg["id"]] = unsubscribe
+    listeners[key] = send
+    connection.send_result(msg["id"])
+
+    # Send the current map straight away. Waiting for the next tick would leave
+    # a panel that has just opened blank for several seconds for no reason.
+    send(await async_build_map(hass))
+
+
+@callback
+def async_start_publisher(hass: HomeAssistant) -> Any:
+    """Keep the map current, and push it to whoever is watching.
+
+    Nothing used to compute a layout unless a panel asked for one, which had two
+    consequences worth removing. A panel opening waited out a full solve before
+    it showed anything, and calibration -- which only advances when a solve
+    happens -- stopped entirely whenever nobody was looking, so the map a user
+    came back to was no better settled than the one they left.
+    """
+    data = hass.data.setdefault(DOMAIN, {})
+
+    async def _publish(_now: Any) -> None:
+        # A tick that takes longer than the interval must not stack up behind
+        # itself. The solve is single-flighted anyway, but two publishes in
+        # flight would still deliver out of order.
+        if data.get("publishing"):
+            return
+        listeners = data.get("listeners") or {}
+        cache = data.get("solve_cache") or {}
+        idle_for = time.monotonic() - cache.get("at", 0.0)
+        if not listeners and idle_for < IDLE_SOLVE_SECONDS:
+            return
+
+        data["publishing"] = True
+        try:
+            payload = await async_build_map(hass)
+        except Exception:  # pragma: no cover - a publisher must not die
+            _LOGGER.exception("Failed to build the map for subscribers")
+            return
+        finally:
+            data["publishing"] = False
+
+        for send in list(listeners.values()):
+            send(payload)
+
+    return async_track_time_interval(hass, _publish, LIVE_INTERVAL)
 
 
 async def _async_cached_solve(

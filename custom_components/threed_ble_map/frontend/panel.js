@@ -43,6 +43,8 @@ class ThreeDBleMapPanel extends HTMLElement {
     this._showBeacons = true;
     this._expanded = false;
     this._rendered = false;
+    this._mapSubscription = null;
+    this._subscribing = false;
   }
 
   set hass(hass) {
@@ -85,6 +87,7 @@ class ThreeDBleMapPanel extends HTMLElement {
   disconnectedCallback() {
     clearInterval(this._timer);
     this._timer = null;
+    this._unsubscribeMap();
     window.removeEventListener("resize", this._onResize);
     window.removeEventListener("popstate", this._onPopState);
     window.removeEventListener("keydown", this._onKeyDown);
@@ -139,12 +142,54 @@ class ThreeDBleMapPanel extends HTMLElement {
     requestAnimationFrame(() => this._scene && this._scene.resize());
   }
 
+  // The map arrives by subscription rather than by asking. The integration
+  // recomputes it on its own clock and pushes each update, so a poll would only
+  // ever re-fetch numbers that had already been sent, and would deliver them
+  // somewhere between nothing and one poll late.
+  async _subscribeMap() {
+    if (this._mapSubscription || this._subscribing || !this._hass) return;
+    this._subscribing = true;
+    try {
+      const unsubscribe = await this._hass.connection.subscribeMessage(
+        (map) => {
+          // A stale subscription must not paint over the signals view after a
+          // tab change that raced the unsubscribe.
+          if (this._view !== "map") return;
+          this._map = map;
+          this._error = null;
+          this._renderView();
+        },
+        { type: "threed_ble_map/subscribe" },
+      );
+      // Leaving the map while the subscription was being set up: tear it down
+      // rather than leaving the server pushing to nobody.
+      if (this._view === "map" && this.isConnected) {
+        this._mapSubscription = unsubscribe;
+      } else {
+        unsubscribe();
+      }
+    } catch (err) {
+      this._error = err.message || "Could not subscribe to the map.";
+      this._renderView();
+    } finally {
+      this._subscribing = false;
+    }
+  }
+
+  _unsubscribeMap() {
+    if (!this._mapSubscription) return;
+    const unsubscribe = this._mapSubscription;
+    this._mapSubscription = null;
+    unsubscribe();
+  }
+
   async _refresh() {
     if (!this._hass) return;
     const send = (message) => this._hass.connection.sendMessagePromise(message);
     try {
       if (this._view === "map") {
-        this._map = await send({ type: "threed_ble_map/anchor_map" });
+        this._subscribeMap();
+        return;
       } else {
         const [adapters, signals] = await Promise.all([
           send({ type: "threed_ble_map/adapters" }),
@@ -165,6 +210,7 @@ class ThreeDBleMapPanel extends HTMLElement {
     if (view === this._view) return;
     // The overlay belongs to the map; leaving the tab must take it down.
     this._setExpanded(false);
+    this._unsubscribeMap();
     this._view = view;
     if (push) {
       history.pushState(

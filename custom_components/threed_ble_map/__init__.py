@@ -20,7 +20,7 @@ from .const import (
     STATIC_URL_BASE,
 )
 from .recorder import SignalRecorder
-from .websocket import async_register_websocket_api
+from .websocket import async_register_websocket_api, async_start_publisher
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         recorder = SignalRecorder(hass)
         recorder.async_start()
         data["recorder"] = recorder
+        data["publisher"] = async_start_publisher(hass)
 
     return True
 
@@ -54,6 +55,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry and tear the panel back down."""
     if hass.data.pop(_PANEL_REGISTERED, False):
         panel_custom.async_remove_panel(hass, PANEL_URL_PATH)
+    if stop := hass.data.get(DOMAIN, {}).pop("publisher", None):
+        stop()
+    hass.data.get(DOMAIN, {}).pop("listeners", None)
     if recorder := hass.data.get(DOMAIN, {}).pop("recorder", None):
         recorder.async_stop()
     return True
