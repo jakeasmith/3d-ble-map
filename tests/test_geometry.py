@@ -993,6 +993,104 @@ def test_tracking() -> bool:
     return ok
 
 
+# The live house, as solved on 2026-08-31, with a tag whose true room is known.
+# Yellow sat in the Living Room, directly below the Stretch Room radio upstairs.
+_HOUSE = {
+    "BLE Anchor Garage":               ({"x": -10.2, "y":  3.2, "z": -1.0}, 1),
+    "BLE Anchor Garage Mini 132":      ({"x":  -7.3, "y":  4.4, "z": -0.9}, 1),
+    "BLE Anchor Living Room Mini 132": ({"x":   4.8, "y": -0.1, "z": -0.8}, 1),
+    "EP1 OG Dining Room":              ({"x":   1.3, "y": -0.8, "z": -1.0}, 1),
+    "Office EPL":                      ({"x":  -1.6, "y":  2.4, "z": -1.0}, 1),
+    "BLE Anchor Guest Room":           ({"x":   1.0, "y": -5.1, "z":  1.7}, 2),
+    "BLE Anchor Main Bedroom":         ({"x":   6.8, "y": -5.5, "z":  1.5}, 2),
+    "Stretch Presence":                ({"x":   5.1, "y":  1.4, "z":  1.5}, 2),
+}
+_RADIOS = {name: point for name, (point, _level) in _HOUSE.items()}
+_LEVELS = {name: level for name, (_point, level) in _HOUSE.items()}
+
+# What the radios actually reported for that tag.
+_YELLOW = {
+    "Stretch Presence": -70.8,
+    "BLE Anchor Living Room Mini 132": -84.3,
+    "Office EPL": -85.3,
+    "EP1 OG Dining Room": -85.5,
+    "BLE Anchor Garage": -90.0,
+    "BLE Anchor Guest Room": -91.0,
+    "BLE Anchor Main Bedroom": -92.0,
+    "BLE Anchor Garage Mini 132": -94.0,
+}
+
+
+def test_storey_of_the_named_radio() -> bool:
+    """The radio named for a beacon must be on the beacon's own storey.
+
+    A ceiling costs about 6 dB; several metres of floor costs more. So a beacon
+    directly beneath an upstairs radio out-shouts a radio in its own room across
+    the room, and naming the loudest puts it one storey out. This is the real
+    case that exposed it, with the real numbers.
+    """
+    chosen, loudest, margin = tracking.nearest_anchor(
+        _YELLOW, 0.08, _RADIOS, _LEVELS
+    )
+    ok = check(
+        "the loudest radio really is the upstairs one",
+        loudest == "Stretch Presence",
+        f"{loudest} at {_YELLOW[loudest]} dBm, "
+        f"{_YELLOW['Stretch Presence'] - _YELLOW['BLE Anchor Living Room Mini 132']:.1f} dB "
+        "louder than the radio in the room it was actually in",
+    )
+    ok &= check(
+        "but the radio named is downstairs, where the tag was",
+        chosen == "BLE Anchor Living Room Mini 132",
+        f"named {chosen}, height margin {margin:.2f} m",
+    )
+
+    # A tag genuinely upstairs must not be dragged down by the same rule.
+    upstairs = dict(_YELLOW)
+    chosen_up, _, _ = tracking.nearest_anchor(upstairs, 1.5, _RADIOS, _LEVELS)
+    ok &= check(
+        "a beacon solved at upstairs height still gets an upstairs radio",
+        chosen_up == "Stretch Presence",
+        f"named {chosen_up}",
+    )
+
+    # Nothing to go on: no height, one storey, or no radio on the storey.
+    plain, _, _ = tracking.nearest_anchor(_YELLOW, None, _RADIOS, _LEVELS)
+    ok &= check(
+        "with no solved height it falls back to the loudest",
+        plain == "Stretch Presence",
+        f"named {plain}",
+    )
+    single = {a: v for a, v in _LEVELS.items() if v == 1}
+    flat, _, _ = tracking.nearest_anchor(
+        {a: v for a, v in _YELLOW.items() if a in single}, 0.0, _RADIOS, single
+    )
+    ok &= check(
+        "a single-storey house is unaffected",
+        flat == "BLE Anchor Living Room Mini 132",
+        f"named {flat}",
+    )
+    only_up = {a: v for a, v in _YELLOW.items() if _LEVELS[a] == 2}
+    fallback, _, _ = tracking.nearest_anchor(only_up, -1.0, _RADIOS, _LEVELS)
+    ok &= check(
+        "when no radio on the beacon's storey heard it, the loudest is used",
+        fallback == "Stretch Presence",
+        f"named {fallback}",
+    )
+
+    # The margin has to report an honest doubt, not a fake certainty.
+    heights = tracking.storey_heights(_RADIOS, _LEVELS)
+    midpoint = sum(heights.values()) / len(heights)
+    _, _, tiny = tracking.nearest_anchor(_YELLOW, midpoint, _RADIOS, _LEVELS)
+    ok &= check(
+        "a height exactly between storeys reports no margin",
+        abs(tiny) < 0.05,
+        f"margin {tiny:.3f} m at z={midpoint:.2f}, against "
+        f"{margin:.2f} m for the real reading",
+    )
+    return ok
+
+
 def main() -> int:
     passed = True
     for test in (
@@ -1008,6 +1106,7 @@ def main() -> int:
         test_calibration,
         test_solver_subprocess,
         test_tracking,
+        test_storey_of_the_named_radio,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")

@@ -396,8 +396,10 @@ def _track_beacons(
             for source, readings in observations.items()
             if beacon["address"] in readings
         }
-        loudest = max(heard, key=heard.get) if heard else None
-        anchor = anchors.get(loudest) if loudest else None
+        chosen, loudest, margin = tracking.nearest_anchor(
+            heard, position.get("z"), frame["radios"], frame.get("levels") or {}
+        )
+        anchor = anchors.get(chosen) if chosen else None
         beacons.append(
             {
                 **beacon,
@@ -406,6 +408,10 @@ def _track_beacons(
                 "rssi": round(heard[loudest]) if loudest else beacon.get("rssi"),
                 "nearest_anchor": anchor["label"] if anchor else None,
                 "nearest_area": anchor["area"] if anchor else None,
+                "loudest_anchor": (anchors.get(loudest) or {}).get("label")
+                if loudest
+                else None,
+                "storey_margin_m": round(margin, 2),
             }
         )
     beacons.sort(key=lambda beacon: -(beacon["rssi"] or -127))
@@ -629,7 +635,7 @@ async def _async_solve(
     _apply_calibration(hass, result)
     result["beacons"] = _describe_beacons(
         result.get("beacons") or [], observations, recorder.names(), anchors,
-        evidence, known, weights,
+        evidence, known, weights, result.get("positions"),
     )
     result["weighted_beacons"] = sum(1 for w in weights.values() if w >= 0.5)
     result["trust"] = weights
@@ -765,13 +771,17 @@ def _describe_beacons(
     evidence: dict[str, dict[str, float]] | None = None,
     known: set[str] | None = None,
     trust: dict[str, float] | None = None,
+    positions: dict[str, dict[str, float]] | None = None,
 ) -> list[dict[str, Any]]:
     """Attach a name and a nearest radio to each solved beacon.
 
-    The nearest radio is taken from the strongest reading, not from the solved
-    coordinates. That is deliberate: "which radio hears this loudest" is a raw
-    measurement that survives any amount of geometry error, so it stays right
-    even where the 3D position is barely better than a guess. It is the field to
+    The radio named is the loudest one *on the beacon's storey*, not the loudest
+    overall -- see tracking.nearest_anchor for why those differ and which is
+    right. `loudest_anchor` keeps the raw answer, and `storey_margin_m` says how
+    firmly the height decided.
+
+    Within a storey the choice is still a raw strongest-reading lookup, which is
+    what makes it survive any amount of geometry error. It remains the field to
     trust when the uncertainty radius is large.
     """
     described = []
@@ -782,8 +792,13 @@ def _describe_beacons(
             for source in observations
             if address in observations[source]
         }
-        loudest = max(heard, key=heard.get) if heard else None
-        anchor = anchors.get(loudest) if loudest else None
+        chosen, loudest, margin = tracking.nearest_anchor(
+            heard,
+            beacon.get("z"),
+            positions or {},
+            {a: v["level"] for a, v in anchors.items() if v.get("level") is not None},
+        )
+        anchor = anchors.get(chosen) if chosen else None
         facts = (evidence or {}).get(address, {})
         described.append(
             {
@@ -796,6 +811,10 @@ def _describe_beacons(
                 "trust": round((trust or {}).get(address, 1.0), 2),
                 "nearest_anchor": anchor["label"] if anchor else None,
                 "nearest_area": anchor["area"] if anchor else None,
+                "loudest_anchor": (anchors.get(loudest) or {}).get("label")
+                if loudest
+                else None,
+                "storey_margin_m": round(margin, 2),
                 "rssi": round(heard[loudest]) if loudest else None,
             }
         )

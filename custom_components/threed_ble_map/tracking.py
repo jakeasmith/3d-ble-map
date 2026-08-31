@@ -178,3 +178,73 @@ def _limit(start: list[float], end: list[float], warm: bool) -> dict[str, float]
         share = MAX_STEP_M / distance
         end = [s + (e - s) * share for s, e in zip(start, end)]
     return {axis: round(value, 2) for axis, value in zip(("x", "y", "z"), end)}
+
+
+def storey_heights(
+    radios: dict[str, dict[str, float]], levels: dict[str, float]
+) -> dict[float, float]:
+    """Building level -> the mean solved height of the radios on it."""
+    heights: dict[float, list[float]] = {}
+    for anchor, point in radios.items():
+        if (level := levels.get(anchor)) is not None:
+            heights.setdefault(level, []).append(point["z"])
+    return {level: sum(v) / len(v) for level, v in heights.items()}
+
+
+def storey_of(z: float, heights: dict[float, float]) -> tuple[float | None, float]:
+    """Which storey a height belongs to, and how clear the call is.
+
+    Same rule the solver itself uses to decide how much floor loss to book on a
+    reading (refine._beacon_levels): nearest storey by mean radio height.
+    Reporting a beacon's storey by a *different* rule than the fit assumed is
+    the actual inconsistency, so this reuses that one.
+
+    The margin is how much further away the next-nearest storey is. Near zero
+    means the height genuinely does not decide, and callers should say so
+    rather than pick.
+    """
+    if len(heights) < 2:
+        return (next(iter(heights), None), 0.0)
+    ranked = sorted(heights, key=lambda level: abs(heights[level] - z))
+    first, second = ranked[0], ranked[1]
+    margin = abs(heights[second] - z) - abs(heights[first] - z)
+    return first, margin
+
+
+def nearest_anchor(
+    heard: dict[str, float],
+    z: float | None,
+    radios: dict[str, dict[str, float]],
+    levels: dict[str, float],
+) -> tuple[str | None, str | None, float]:
+    """The radio to name for a beacon: (chosen, loudest overall, storey margin).
+
+    The loudest radio is not the nearest one when a floor is involved. A ceiling
+    costs about 6 dB in a house; several metres of horizontal distance costs
+    more. So a beacon sitting directly beneath an upstairs radio out-shouts a
+    radio in its own room across the room -- reliably, not occasionally.
+
+    Measured here: a tag in the Living Room read -70.8 dBm at the radio in the
+    room directly above it and -84.3 dBm at the radio in the room it was
+    actually in. Reporting the loudest put it on the wrong storey.
+
+    So the storey is decided by the solved height, which has the building's
+    structure behind it, and the radio is then the loudest one *on that storey*.
+    Where the height does not decide, or no radio on that storey heard the
+    beacon, the loudest overall is used and the caller can see the margin.
+    """
+    if not heard:
+        return None, None, 0.0
+    loudest = max(heard, key=heard.get)
+    if z is None:
+        return loudest, loudest, 0.0
+
+    heights = storey_heights(radios, levels)
+    level, margin = storey_of(z, heights)
+    if level is None:
+        return loudest, loudest, 0.0
+
+    on_storey = {a: v for a, v in heard.items() if levels.get(a) == level}
+    if not on_storey:
+        return loudest, loudest, margin
+    return max(on_storey, key=on_storey.get), loudest, margin
