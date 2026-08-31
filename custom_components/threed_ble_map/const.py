@@ -75,4 +75,33 @@ MAX_SOLVE_BEACONS = 120
 # running waits on it.
 SOLVE_SLOW_SECONDS = 5.0
 
+# The share of each new solve that reaches the published layout once the map has
+# settled. Radios are infrastructure: they do not move between one solve and the
+# next, but the solver returns a slightly different answer every time and the map
+# visibly contorts. Measured, consecutive solves moved it 2.02 m RMS with nothing
+# in the house having changed.
+#
+# So a solve is evidence, not the answer. Measured over 150 solves of one static
+# capture, against the exact step response of the same filter:
+#
+#     rate    resting jitter    63% of a real move    95%
+#     today         2.023 m          immediate        immediate
+#     0.20          0.332 m           1.8 min          5.1 min
+#     0.10          0.163 m           3.7 min         10.6 min
+#     0.05          0.082 m           7.3 min         21.6 min
+#     0.03          0.049 m          12.1 min         36.3 min
+#     0.01          0.056 m          36.3 min        109.6 min
+#
+# 0.03 is where the curve stops paying. Below it the jitter does not improve --
+# 0.01 is slightly worse, because what remains is not per-solve noise but the
+# occasional solve landing in a different basin, which averaging cannot remove --
+# while the time to notice a radio that genuinely moved triples. Above it,
+# stillness is given up for responsiveness the problem does not need: radios are
+# screwed to shelves, and twelve minutes to follow one that really moved is not
+# a cost anyone pays often.
+#
+# It is a 41x reduction in per-update movement, and 5 cm on a house-sized map
+# reads as still.
+CALIBRATION_RATE = 0.03
+
 WS_RAW_OBSERVATIONS = f"{DOMAIN}/raw_observations"

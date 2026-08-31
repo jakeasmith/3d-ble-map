@@ -269,6 +269,59 @@ beacons below `MIN_RADIOS_PER_BEACON` and starves a solver already short of
 constraint: over 24 runs the median improved to 2.59 m while the worst case went
 from 5.15 m to **11.70 m**. Same lesson as *Fits better, locates worse* above.
 
+### The radios are calibrated, not re-solved
+
+A solve is evidence, not the answer. Radios are infrastructure -- they sit on
+shelves and do not move between one solve and the next -- but the solver returns
+a slightly different answer every time, and consecutive solves were moving the
+map **2.02 m RMS with nothing in the house having changed**.
+
+So a calibrated layout is kept and each new solve is blended into it at
+`CALIBRATION_RATE`. Noise averages away; a radio that genuinely moved is followed
+over minutes instead of instantly.
+
+Two things happen in that order, and the first is easy to miss. The solver has no
+preferred rotation about the vertical axis and no preferred handedness, so
+consecutive solves come back arbitrarily spun and mirrored. **Averaging two
+layouts in different frames is meaningless** -- it would shrink the map toward
+its own centroid. Each candidate is therefore rotated onto the calibrated frame
+first, and only then blended. The beacons are moved by the identical transform,
+since they are solved in the same frame and would otherwise be left floating in
+the previous solve's orientation.
+
+Only yaw and handedness are free. The vertical axis is pinned by the storey
+constraints and oriented before refinement, so it is already consistent between
+solves. That keeps the alignment a closed form and avoids taking on an SVD.
+
+Measured over 150 solves of one static capture, against the exact step response
+of the same filter:
+
+| rate | resting jitter | 63% of a real move | 95% |
+| --- | --- | --- | --- |
+| today | 2.023 m | immediate | immediate |
+| 0.20 | 0.332 m | 1.8 min | 5.1 min |
+| 0.10 | 0.163 m | 3.7 min | 10.6 min |
+| **0.03** | **0.049 m** | **12.1 min** | **36.3 min** |
+| 0.01 | 0.056 m | 36.3 min | 109.6 min |
+
+0.03 is where the curve stops paying. Below it the jitter does not improve --
+0.01 is slightly *worse*, because what remains is not per-solve noise but the
+occasional solve landing in a different basin, which averaging cannot remove --
+while the time to notice a real move triples.
+
+The early solves are a running mean (1, 1/2, 1/3 ...) before the rate stiffens to
+0.03, so a fresh install establishes a map in a few solves rather than creeping
+toward one. A radio the layout has never seen is adopted outright; a radio
+missing from one solve keeps its place, so a proxy dropping off Wi-Fi for a
+minute does not erase it.
+
+**What this does not fix.** The alignment is rigid, so when one radio genuinely
+moves, the best fit onto the *old* layout explains part of that away as a global
+shift and rotation. The shape converges exactly on the new truth; the frame it
+settles in is its own. Since the origin and orientation of this map carry no
+meaning anyway, that costs nothing -- but it does mean absolute coordinates are
+the wrong thing to measure convergence with.
+
 ### Standing still
 
 SMACOF is a local method, and the search used to start cold on every poll. Two

@@ -18,11 +18,12 @@ from homeassistant.helpers import (
     floor_registry as fr,
 )
 
-from . import geometry, quality
+from . import calibration, geometry, quality
 from .const import (
     DEFAULT_SIGNAL_LIMIT,
     DOMAIN,
     MAX_SIGNAL_LIMIT,
+    CALIBRATION_RATE,
     MIN_RECORDING_SECONDS,
     SOLVE_CACHE_SECONDS,
     SOLVE_SLOW_SECONDS,
@@ -456,7 +457,7 @@ async def _async_solve(
             direct,
             observations,
             levels,
-            previous=hass.data[DOMAIN]["solve_cache"].get("positions"),
+            previous=hass.data[DOMAIN]["solve_cache"].get("calibrated"),
         )
     )
     elapsed = time.monotonic() - started
@@ -472,6 +473,7 @@ async def _async_solve(
             result.get("beacons_used") or 0,
             SOLVE_CACHE_SECONDS,
         )
+    _apply_calibration(hass, result)
     result["beacons"] = _describe_beacons(
         result.get("beacons") or [], observations, recorder.names(), anchors,
         evidence, known, weights,
@@ -481,6 +483,51 @@ async def _async_solve(
     result["tracked_beacons"] = tracked
 
     return result
+
+
+def _apply_calibration(hass: HomeAssistant, result: dict[str, Any]) -> None:
+    """Publish a calibrated layout rather than this solve's raw answer.
+
+    The solve is evidence, not the answer. Each one is spun into the calibrated
+    frame and blended in at CALIBRATION_RATE, so noise averages away while a
+    radio that has genuinely moved is followed over minutes.
+
+    The beacons are moved by the same transform. They are solved in the same
+    frame as the radios, so publishing calibrated radios without carrying the
+    beacons along would leave them in the previous solve's orientation.
+    """
+    solved = result.get("positions")
+    if not solved:
+        return
+    cache = hass.data.setdefault(DOMAIN, {}).setdefault("solve_cache", {})
+    reference = cache.get("calibrated")
+    solves = cache.get("solves", 0)
+
+    calibrated, rate, transform = calibration.calibrate(
+        reference, solved, solves, CALIBRATION_RATE
+    )
+    moved = calibration.movement(reference, calibrated)
+
+    cache["calibrated"] = calibrated
+    cache["solves"] = solves + 1
+
+    result["positions"] = {
+        anchor: {axis: round(value, 2) for axis, value in point.items()}
+        for anchor, point in calibrated.items()
+    }
+    result["beacons"] = [
+        {**beacon, **{
+            axis: round(value, 2)
+            for axis, value in calibration.apply(transform, beacon).items()
+        }}
+        for beacon in (result.get("beacons") or [])
+    ]
+    result["calibration"] = {
+        "rate": round(rate, 4),
+        "solves": solves + 1,
+        "settled": rate <= CALIBRATION_RATE,
+        "moved_m": None if moved is None else round(moved, 3),
+    }
 
 
 def _known_addresses(device_reg: dr.DeviceRegistry) -> set[str]:

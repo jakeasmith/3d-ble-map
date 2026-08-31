@@ -38,6 +38,7 @@ def _load(name: str):
 
 geometry = _load("geometry")
 refine = _load("refine")
+calibration = _load("calibration")
 quality = _load("quality")
 
 # A two-storey house, metres. Mirrors the real deployment: five anchors, three
@@ -653,6 +654,138 @@ def test_weak_readings() -> bool:
     return ok
 
 
+def _pairwise_error(layout, truth):
+    """RMS difference in pairwise distances -- the shape, not the coordinates.
+
+    This map is relative: origin and orientation carry no meaning, so comparing
+    absolute positions measures the frame rather than the answer. It matters
+    here because the alignment is rigid, and a rigid fit onto the *old* layout
+    partly explains a single radio's move away as a global shift and rotation.
+    The coordinates therefore settle somewhere offset while the shape converges
+    exactly, which is the thing the map actually claims to produce.
+    """
+    keys = sorted(set(layout) & set(truth))
+    errors = []
+    for i, a in enumerate(keys):
+        for b in keys[i + 1 :]:
+            got = math.dist(
+                [layout[a]["x"], layout[a]["y"], layout[a]["z"]],
+                [layout[b]["x"], layout[b]["y"], layout[b]["z"]],
+            )
+            want = math.dist(
+                [truth[a]["x"], truth[a]["y"], truth[a]["z"]],
+                [truth[b]["x"], truth[b]["y"], truth[b]["z"]],
+            )
+            errors.append(got - want)
+    return math.sqrt(sum(e * e for e in errors) / len(errors))
+
+
+def _square(offset=(0.0, 0.0, 0.0)):
+    return {
+        "a": {"x": 0.0 + offset[0], "y": 0.0 + offset[1], "z": 0.0 + offset[2]},
+        "b": {"x": 4.0 + offset[0], "y": 0.0 + offset[1], "z": 0.0 + offset[2]},
+        "c": {"x": 4.0 + offset[0], "y": 3.0 + offset[1], "z": 0.0 + offset[2]},
+        "d": {"x": 0.0 + offset[0], "y": 3.0 + offset[1], "z": 2.9 + offset[2]},
+    }
+
+
+def test_calibration() -> bool:
+    """Radios are infrastructure. A single solve must barely move them; a
+    consistent stream of them must move them all the way."""
+    ok = True
+    truth = _square()
+
+    # A solve of the same house, spun 40 degrees, mirrored and shifted -- which
+    # is what the solver actually returns, since it has no preferred rotation
+    # about the vertical axis and no preferred handedness.
+    angle = math.radians(40)
+    spun = {}
+    for key, p in truth.items():
+        x, y = -p["x"], p["y"]
+        spun[key] = {
+            "x": x * math.cos(angle) - y * math.sin(angle) + 17.0,
+            "y": x * math.sin(angle) + y * math.cos(angle) - 9.0,
+            "z": p["z"] + 5.0,
+        }
+    recovered = calibration.align(spun, truth)
+    worst = max(
+        math.dist(
+            [recovered[k]["x"], recovered[k]["y"], recovered[k]["z"]],
+            [truth[k]["x"], truth[k]["y"], truth[k]["z"]],
+        )
+        for k in truth
+    )
+    ok &= check(
+        "an arbitrarily spun and mirrored solve is put back in frame",
+        worst < 1e-6,
+        f"worst point off by {worst:.2e} m after alignment",
+    )
+
+    ok &= check(
+        "the first solve is adopted whole",
+        calibration.learning_rate(0, 0.05) == 1.0,
+        "with nothing to average against, a running mean starts at 1.0",
+    )
+    ok &= check(
+        "the rate stiffens to the floor",
+        abs(calibration.learning_rate(500, 0.05) - 0.05) < 1e-9,
+        "after enough evidence the map stops chasing individual solves",
+    )
+
+    # One radio jumps 5 m in a single solve, then never again.
+    rogue = {k: dict(v) for k, v in truth.items()}
+    rogue["b"]["x"] += 5.0
+    reference = {k: dict(v) for k, v in truth.items()}
+    reference, _, _ = calibration.calibrate(reference, rogue, 500, 0.05)
+    drift = _pairwise_error(reference, truth)
+    ok &= check(
+        "one bad solve barely deforms a calibrated map",
+        drift < 0.3,
+        f"a 5 m jump in a single solve changed the shape by {drift:.2f} m RMS, "
+        f"against the {_pairwise_error(rogue, truth):.2f} m it would have "
+        "applied outright",
+    )
+
+    # The same radio really has moved: every subsequent solve agrees.
+    reference = {k: dict(v) for k, v in truth.items()}
+    for _ in range(60):
+        reference, _, _ = calibration.calibrate(reference, rogue, 500, 0.05)
+    tracked = _pairwise_error(reference, rogue)
+    ok &= check(
+        "consistent evidence moves it anyway",
+        tracked < 0.3,
+        f"after 60 agreeing solves the shape is {tracked:.2f} m RMS from the "
+        "new one -- fully tracked, though the frame it settles in is its own",
+    )
+
+    # A beacon has to travel with the radios or it detaches from the map.
+    transform = calibration.alignment(spun, truth)
+    beacon_in_solve = {"x": spun["a"]["x"] + 1.0, "y": spun["a"]["y"], "z": spun["a"]["z"]}
+    moved = calibration.apply(transform, beacon_in_solve)
+    offset = math.dist(
+        [moved["x"], moved["y"], moved["z"]],
+        [recovered["a"]["x"], recovered["a"]["y"], recovered["a"]["z"]],
+    )
+    ok &= check(
+        "beacons travel with the radios",
+        abs(offset - 1.0) < 1e-6,
+        f"a beacon 1 m from radio a stayed {offset:.6f} m from it through the transform",
+    )
+
+    ok &= check(
+        "a radio missing from one solve keeps its place",
+        "d" in calibration.blend(truth, {"a": truth["a"]}, 0.05),
+        "a proxy dropping off Wi-Fi for a minute must not erase it",
+    )
+    ok &= check(
+        "a radio the map has never seen is adopted outright",
+        calibration.blend(truth, {"z": {"x": 9.0, "y": 9.0, "z": 9.0}}, 0.05)["z"]["x"]
+        == 9.0,
+        "there is nothing to average a new radio against",
+    )
+    return ok
+
+
 def test_edge_cases() -> bool:
     ok = check(
         "too few anchors is an error",
@@ -689,6 +822,7 @@ def main() -> int:
         test_link_weighting,
         test_solve_is_bounded,
         test_weak_readings,
+        test_calibration,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")
