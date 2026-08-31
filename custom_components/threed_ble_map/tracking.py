@@ -38,6 +38,7 @@ from .refine import (
     _constrain_beacons,
     _floors_apart,
     _majorize,
+    _rest_length,
     _storeys,
     shadowing_bias,
 )
@@ -265,7 +266,15 @@ def fit_residual(
     rows: list[tuple[int, float]],
     frame: dict[str, Any],
 ) -> float | None:
-    """RMS dB between what the readings say and what this position predicts."""
+    """Weighted RMS dB between what the readings say and this position predicts.
+
+    Unweighted was tried and is nearly blind. A beacon here is typically heard
+    loudly by one radio and faintly by seven, so an unweighted mean lets seven
+    readings near the receiver's sensitivity floor outvote the one reliable
+    reading. Measured on a live capture: two positions 9 m apart scored within
+    1 dB of each other, and the comparison kept the wrong one three times out of
+    four.
+    """
     anchors = frame.get("anchors") or []
     if not rows or not anchors:
         return None
@@ -277,6 +286,7 @@ def fit_residual(
     level, _margin = storey_of(point["z"], heights) if heights else (None, 0.0)
 
     total = 0.0
+    weight_sum = 0.0
     for index, observed in rows:
         anchor = anchors[index]
         radio = radios[anchor]
@@ -287,15 +297,32 @@ def fit_residual(
             ),
             0.3,
         )
+        gain = float(frame["gains"].get(anchor, 0.0))
         crossed = penalty * _floors_apart(levels.get(anchor), level)
         predicted = (
             TX_POWER_AT_1M
             - 10 * PATH_LOSS_EXPONENT * math.log10(distance * bias)
-            + float(frame["gains"].get(anchor, 0.0))
+            + gain
             - crossed
         )
-        total += (observed - predicted) ** 2
-    return math.sqrt(total / len(rows))
+        # Weight by how tightly the reading itself pins a position: a reading
+        # implying a metre constrains far harder than one implying twenty, and
+        # the same fixed dB error is a proportional distance error.
+        #
+        # The weight comes from the RANGE THE READING IMPLIES, never from the
+        # candidate's own distance. Weighting by the candidate would let a
+        # position escape its own error by moving further away -- the same
+        # self-stabilising trap the Huber weight already sets, and the reason
+        # this function exists.
+        implied = _rest_length(observed - gain + crossed, bias)
+        if implied is None:
+            continue
+        weight = 1.0 / (implied * implied)
+        total += weight * (observed - predicted) ** 2
+        weight_sum += weight
+    if weight_sum <= 0:
+        return None
+    return math.sqrt(total / weight_sum)
 
 
 def better_of(
