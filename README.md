@@ -424,6 +424,105 @@ calibration instead gives 3.07 m.
 
 Run the checks with `python3 tests/test_geometry.py`.
 
+### The solve runs in a child process
+
+The solver is pure Python with no numpy, so it holds the interpreter lock for as
+long as it runs. In an executor thread -- which is what Home Assistant offers --
+that makes every `await` in the whole instance wait for the GIL switch interval.
+Measured against a coroutine that should tick every 10 ms:
+
+| | median | p95 | worst |
+|---|---|---|---|
+| idle, no solve | 0.13 ms | 0.20 ms | 0.31 ms |
+| solve in an executor thread | 5.22 ms | 5.31 ms | 10.40 ms |
+| solve in a subprocess | 0.14 ms | 0.22 ms | 1.24 ms |
+
+5.22 ms is the switch interval exactly. A solve takes several seconds and runs
+every fifteen to twenty, so a quarter of the time every websocket frame, state
+write and API response was paying it -- including the API responses the
+supervisor watchdog counts before it restarts core. Single-flighting the solve
+stopped them piling up; it could not stop one solve slowing everything around it.
+
+A process per solve rather than a pool. Interpreter start plus the solver's
+imports is about a fifth of a second against a solve of several seconds, and in
+exchange there is no worker to keep alive, restart or leak, and a solve that
+wedges is killed at a deadline rather than burning a core forever. Measured on
+the live instance afterwards: 4243 websocket round trips over 90 seconds with
+solves running more than half of it, median 0.9 ms, p99 1.8 ms.
+
+### Beacons are tracked between solves, not re-solved
+
+A full solve searches for every radio position, every gain and every beacon at
+once, from twelve starting points. That is how a frame gets established, and it
+costs seconds -- so it is cached, and the map used to spend nearly all its time
+showing beacon positions computed for a house that had already moved on.
+
+The radios are infrastructure. Since calibration they move about 5 cm per
+update, and with them held still each beacon is three unknowns and a handful of
+ranges to known points:
+
+| | cost | drift from the joint answer |
+|---|---|---|
+| full joint solve, 92 beacons | 7060 ms | -- |
+| tracked, 2 sweeps | 2.8 ms | median 0.20 m, p90 0.95 m |
+
+So beacons move on every update rather than every fifteen seconds, and the
+expensive solve goes back to doing the one thing only it can do.
+
+The physics is not reimplemented. `tracking` calls `refine`'s own majorization
+sweep and puts the radios back afterwards, so the objective, the Huber and
+1/d^2 weighting, the floor-crossing penalty and the vertical envelope are
+necessarily the ones the full solve used. A hand-rolled version that dropped the
+floor penalty and the envelope was written first and disagreed by 7 m.
+
+A full Guttman step overshoots on a beacon heard by exactly three radios, where
+the answer is a mirror pair: twelve of ninety-two settled into a two-cycle
+metres wide instead of converging. Taking 0.7 of each step lands on the midpoint
+of that cycle -- 0.32 m of resting jitter and about 12 s to follow a real move,
+against 0.48 m and one update undamped.
+
+Tracked beacons are **not** put through the calibration transform. That
+transform carries a point out of a solve's own arbitrary frame into the
+published one, which is what a solve's freshly returned beacons need and what
+the tracked beacons are already in. Applying it to them spins points that were
+already right, by a rotation that differs from solve to solve: live, the map
+lurched a median of 21.9 m on two consecutive solves and not at all on a third.
+
+### The map is maintained, not requested
+
+Nothing used to compute a layout unless a panel asked for one, so a panel
+opening waited out a full solve, and calibration -- which only advances when a
+solve happens -- stopped whenever nobody was looking. A timer now keeps the map
+current on the recorder's own five-second interval and pushes it to whoever has
+subscribed. With nobody watching, a full solve still runs every five minutes so
+calibration keeps converging.
+
+The publisher never waits for a solve. Its tick is five seconds and a solve
+takes about seven, so waiting made it skip two ticks in every five and the map
+froze for twelve seconds each time the layout was re-solved -- the exact stall
+this path exists to remove. It publishes the tracked map against the frame it
+has and lets the solve land when it lands. Someone who asks for the map directly
+still waits, because they are owed an answer.
+
+### Adaptive smoothing: measured and rejected
+
+The recorder keeps a fast and a slow average of every reading, and the gap
+between them is a movement detector, so letting a large gap raise the smoothing
+rate looks free. It is the opposite of free: a higher rate puts more noise in
+the fast average, which widens the gap, which raises the rate again. Over 40
+runs at this house's measured 7.8 dB of shadowing:
+
+| | residual RMS | mean rate | settling |
+|---|---|---|---|
+| stationary, fixed | 2.96 dB | 0.25 | |
+| stationary, adaptive | 4.40 dB | 0.50 | |
+| moving, fixed | 3.20 dB | 0.25 | 338 s |
+| moving, adaptive | 4.85 dB | 0.54 | 985 s |
+
+Worse on both counts, including the one it was built for -- it latches high even
+at rest. The smoothing lag is the price of a 7.8 dB channel and no scheme avoids
+paying it.
+
 ## Requirements
 
 - Home Assistant 2025.2.0 or newer
