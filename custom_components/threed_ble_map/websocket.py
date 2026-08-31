@@ -18,7 +18,7 @@ from homeassistant.helpers import (
     floor_registry as fr,
 )
 
-from . import calibration, quality, solver_process
+from . import calibration, quality, solver_process, tracking
 from .const import (
     DEFAULT_SIGNAL_LIMIT,
     DOMAIN,
@@ -323,10 +323,11 @@ async def ws_anchor_map(
     if not ready:
         result = {"positions": {}, "pairs": [], "stress": None, "error": None}
     else:
+        by_source = {anchor["source"]: anchor for anchor in anchors}
         result = await _async_cached_solve(
-            hass, recorder, ordered, levels,
-            {anchor["source"]: anchor for anchor in anchors},
+            hass, recorder, ordered, levels, by_source
         )
+        result = _track_beacons(hass, recorder, result, by_source)
 
     connection.send_result(
         msg["id"],
@@ -338,6 +339,62 @@ async def ws_anchor_map(
             **result,
         },
     )
+
+
+def _track_beacons(
+    hass: HomeAssistant,
+    recorder: Any,
+    result: dict[str, Any],
+    anchors: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Move the beacons to where the newest readings put them.
+
+    A full solve costs seconds, so it is cached for fifteen and the panel spent
+    most of its time being shown beacon positions computed for a house that had
+    already moved on. With the radios held still a beacon is three unknowns and
+    a few ranges, which is milliseconds -- so it runs on every request instead,
+    and the expensive solve goes back to doing the one thing only it can do:
+    establishing the frame the cheap pass measures against.
+
+    The cached result is never mutated. Several callers share it, and one of
+    them writing a newer set of beacons into it would hand the others a map
+    whose radios and beacons came from different moments.
+    """
+    cache = hass.data.get(DOMAIN, {}).get("solve_cache") or {}
+    frame = cache.get("frame")
+    if not frame or not result.get("positions"):
+        return result
+
+    observations = recorder.observations(frame["anchors"])
+    tracked = tracking.track(frame, observations, cache.get("tracked"))
+    if not tracked:
+        return result
+    cache["tracked"] = tracked
+
+    beacons = []
+    for beacon in result.get("beacons") or []:
+        position = tracked.get(beacon["address"])
+        if position is None:
+            continue
+        heard = {
+            source: readings[beacon["address"]]
+            for source, readings in observations.items()
+            if beacon["address"] in readings
+        }
+        loudest = max(heard, key=heard.get) if heard else None
+        anchor = anchors.get(loudest) if loudest else None
+        beacons.append(
+            {
+                **beacon,
+                **position,
+                "radios": len(heard),
+                "rssi": round(heard[loudest]) if loudest else beacon.get("rssi"),
+                "nearest_anchor": anchor["label"] if anchor else None,
+                "nearest_area": anchor["area"] if anchor else None,
+            }
+        )
+    beacons.sort(key=lambda beacon: -(beacon["rssi"] or -127))
+    return {**result, "beacons": beacons, "beacons_tracked": True}
 
 
 async def _async_cached_solve(
@@ -480,6 +537,16 @@ async def _async_solve(
     result["weighted_beacons"] = sum(1 for w in weights.values() if w >= 0.5)
     result["trust"] = weights
     result["tracked_beacons"] = tracked
+
+    # Everything the between-solves tracker needs, taken after calibration so
+    # it is already in the frame the panel is shown.
+    cache = hass.data[DOMAIN]["solve_cache"]
+    cache["frame"] = tracking.frame_from(result, levels)
+    cache["tracked"] = {
+        beacon["address"]: {axis: beacon[axis] for axis in ("x", "y", "z")}
+        for beacon in (result.get("beacons") or [])
+        if "x" in beacon
+    }
 
     return result
 
