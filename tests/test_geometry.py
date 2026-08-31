@@ -1091,6 +1091,69 @@ def test_storey_of_the_named_radio() -> bool:
     return ok
 
 
+def test_drifted_beacon_can_come_back() -> bool:
+    """A tracked beacon that wandered must be re-seeded by the full solve.
+
+    This is the failure that made four transmitters stacked physically on top of
+    one another land 7.6 m apart on a live map. Once a beacon is far from where
+    its readings put it, the residual on the reading that would pull it home is
+    tens of dB, and the Huber weighting suppresses exactly that reading as an
+    outlier -- so the tracker cannot recover on its own. The escape has to come
+    from the solve, which searches globally.
+    """
+    random.seed(20260831)
+    direct, observations, _truth = simulate()
+    anchors = list(TRUTH)
+    solved = geometry.solve_layout(anchors, direct, observations, LEVELS)
+    frame = tracking.frame_from(solved, LEVELS)
+    placed = _beacon_map(solved)
+
+    index = {a: i for i, a in enumerate(frame["anchors"])}
+    rows = {}
+    for anchor, readings in observations.items():
+        if anchor in index:
+            for address, rssi in readings.items():
+                rows.setdefault(address, []).append((index[anchor], rssi))
+
+    address = next(iter(placed))
+    good = placed[address]
+    drifted = {"x": good["x"] + 9.0, "y": good["y"] - 7.0, "z": good["z"]}
+
+    here = tracking.fit_residual(drifted, rows[address], frame)
+    there = tracking.fit_residual(good, rows[address], frame)
+    ok = check(
+        "a drifted position really does fit worse",
+        here > there,
+        f"{here:.1f} dB adrift against {there:.1f} dB at the solved position",
+    )
+    ok &= check(
+        "and the solve takes it back",
+        tracking.better_of(drifted, good, rows[address], frame) is good,
+        f"re-seeded from {math.dist([drifted[k] for k in 'xyz'], [good[k] for k in 'xyz']):.1f} m away",
+    )
+
+    # The tracker must still win where it is genuinely the better answer,
+    # otherwise every solve throws away the freshness this path exists for.
+    kept = 0
+    for addr, point in placed.items():
+        if tracking.better_of(point, point, rows.get(addr) or [], frame) is point:
+            kept += 1
+    ok &= check(
+        "an agreeing solve does not disturb a tracked beacon",
+        kept == len(placed),
+        f"{kept} of {len(placed)} kept their tracked position",
+    )
+
+    # Ties go to not moving, exactly as WARM_HYSTERESIS does for the radios.
+    nudged = {"x": good["x"] + 0.01, "y": good["y"], "z": good["z"]}
+    ok &= check(
+        "a tie leaves the beacon where it is",
+        tracking.better_of(good, nudged, rows[address], frame) is good,
+        f"hysteresis {tracking.RESEED_HYSTERESIS_DB} dB",
+    )
+    return ok
+
+
 def main() -> int:
     passed = True
     for test in (
@@ -1107,6 +1170,7 @@ def main() -> int:
         test_solver_subprocess,
         test_tracking,
         test_storey_of_the_named_radio,
+        test_drifted_beacon_can_come_back,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")

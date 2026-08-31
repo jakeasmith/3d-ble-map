@@ -646,24 +646,42 @@ async def _async_solve(
     cache = hass.data[DOMAIN]["solve_cache"]
     cache["frame"] = tracking.frame_from(result, levels)
 
-    # Adopt this solve's beacons only where nothing is tracking them yet.
+    # Let the tracked position and this solve's answer compete on fit.
     #
-    # Replacing them all was tried and is visibly wrong: the radios take three
-    # percent of each new solve, so a beacon handed the solve's answer whole is
-    # placed against a frame the radios have barely moved towards. Measured
-    # live, beacons jumped a median of 1.9 m and as much as 48 m on the tick a
-    # solve landed, which is the contortion calibration exists to prevent,
-    # relocated from the radios to the beacons.
+    # Adopting the solve for everything was tried and jumped the map; adopting it
+    # for nothing was tried next and was worse, because a tracked beacon then had
+    # no way back once it drifted -- the reading that would pull it home is by
+    # then a 30 dB residual, which the Huber weighting suppresses as an outlier.
+    # Four transmitters stacked on top of each other ended up 7.6 m apart.
     #
-    # Carrying them through the same transform keeps them in step, and the
-    # tracker walks them onto the new frame over the next few ticks.
+    # The radios have never had this problem, because refine offers the previous
+    # layout as one more starting point and the cold search still runs in full
+    # every solve. This gives the beacons the same escape: the solve decides
+    # which basin, tracking refines within it.
+    frame = cache["frame"]
+    index = {anchor: i for i, anchor in enumerate(frame.get("anchors") or [])}
+    rows: dict[str, list[tuple[int, float]]] = {}
+    for anchor, readings in observations.items():
+        if anchor not in index:
+            continue
+        for address, rssi in readings.items():
+            rows.setdefault(address, []).append((index[anchor], rssi))
+
     tracked = dict(cache.get("tracked") or {})
+    reseeded = 0
     for beacon in result.get("beacons") or []:
-        if "x" in beacon and beacon["address"] not in tracked:
-            tracked[beacon["address"]] = {
-                axis: beacon[axis] for axis in ("x", "y", "z")
-            }
+        if "x" not in beacon:
+            continue
+        address = beacon["address"]
+        solved = {axis: beacon[axis] for axis in ("x", "y", "z")}
+        chosen = tracking.better_of(
+            tracked.get(address), solved, rows.get(address) or [], frame
+        )
+        if chosen is solved and address in tracked:
+            reseeded += 1
+        tracked[address] = chosen
     cache["tracked"] = tracked
+    result["beacons_reseeded"] = reseeded
 
     return result
 

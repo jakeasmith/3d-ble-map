@@ -33,7 +33,10 @@ from typing import Any
 
 from .refine import (
     MIN_RADIOS_PER_BEACON,
+    PATH_LOSS_EXPONENT,
+    TX_POWER_AT_1M,
     _constrain_beacons,
+    _floors_apart,
     _majorize,
     _storeys,
     shadowing_bias,
@@ -248,3 +251,85 @@ def nearest_anchor(
     if not on_storey:
         return loudest, loudest, margin
     return max(on_storey, key=on_storey.get), loudest, margin
+
+
+# A tracked beacon keeps its place unless a fresh solve fits better by more than
+# this, in dB. Ties go to not moving, for the same reason WARM_HYSTERESIS exists
+# for the radios: two positions a hundredth of a dB apart are indistinguishable
+# as fits and metres apart on screen.
+RESEED_HYSTERESIS_DB = 0.5
+
+
+def fit_residual(
+    point: dict[str, float],
+    rows: list[tuple[int, float]],
+    frame: dict[str, Any],
+) -> float | None:
+    """RMS dB between what the readings say and what this position predicts."""
+    anchors = frame.get("anchors") or []
+    if not rows or not anchors:
+        return None
+    radios = frame["radios"]
+    levels = frame.get("levels") or {}
+    penalty = float(frame.get("floor_penalty_db") or 0.0)
+    bias = shadowing_bias(frame.get("shadowing_db") or 0.0)
+    heights = storey_heights(radios, levels)
+    level, _margin = storey_of(point["z"], heights) if heights else (None, 0.0)
+
+    total = 0.0
+    for index, observed in rows:
+        anchor = anchors[index]
+        radio = radios[anchor]
+        distance = max(
+            math.dist(
+                (point["x"], point["y"], point["z"]),
+                (radio["x"], radio["y"], radio["z"]),
+            ),
+            0.3,
+        )
+        crossed = penalty * _floors_apart(levels.get(anchor), level)
+        predicted = (
+            TX_POWER_AT_1M
+            - 10 * PATH_LOSS_EXPONENT * math.log10(distance * bias)
+            + float(frame["gains"].get(anchor, 0.0))
+            - crossed
+        )
+        total += (observed - predicted) ** 2
+    return math.sqrt(total / len(rows))
+
+
+def better_of(
+    tracked: dict[str, float] | None,
+    solved: dict[str, float] | None,
+    rows: list[tuple[int, float]],
+    frame: dict[str, Any],
+) -> dict[str, float] | None:
+    """Whichever of the two positions the readings actually support.
+
+    The radios already work this way: refine offers the previous layout back as
+    one more starting point, and says of it that it "is not a ratchet -- the cold
+    multi-restart search still runs in full every solve and can take over
+    whenever it genuinely fits better". The beacons had no such escape. A tracked
+    beacon was never re-seeded once placed, and a beacon that wandered could not
+    come back, because the reading that would have pulled it home was by then a
+    30 dB residual and the Huber weighting suppressed it as an outlier. Robust
+    weighting plus a bad position is self-stabilising in the wrong place.
+
+    Measured when that happened: four transmitters stacked physically on top of
+    each other were placed up to 7.6 m apart and 8 to 13 times further from the
+    radio hearing them loudest than their own strongest reading allows. The same
+    readings, solved cold, put them 0.6 to 4.1 m apart at 1.4 to 2.9 times.
+
+    So the full solve -- which restarts six times and searches globally -- decides
+    which basin a beacon is in, and tracking refines it within that basin between
+    solves.
+    """
+    if tracked is None:
+        return solved
+    if solved is None:
+        return tracked
+    here = fit_residual(tracked, rows, frame)
+    there = fit_residual(solved, rows, frame)
+    if here is None or there is None:
+        return tracked
+    return solved if there < here - RESEED_HYSTERESIS_DB else tracked
