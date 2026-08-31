@@ -18,7 +18,7 @@ from homeassistant.helpers import (
     floor_registry as fr,
 )
 
-from . import calibration, geometry, quality
+from . import calibration, quality, solver_process
 from .const import (
     DEFAULT_SIGNAL_LIMIT,
     DOMAIN,
@@ -27,6 +27,7 @@ from .const import (
     MIN_RECORDING_SECONDS,
     SOLVE_CACHE_SECONDS,
     SOLVE_SLOW_SECONDS,
+    SOLVE_TIMEOUT_SECONDS,
     WS_ANCHOR_MAP,
     WS_LIST_ADAPTERS,
     WS_LIST_SIGNALS,
@@ -449,17 +450,15 @@ async def _async_solve(
     # Hand the previous layout back to the solver. It competes against the cold
     # search rather than replacing it, so a house that has genuinely changed
     # still gets re-solved from scratch; see WARM_HYSTERESIS in refine.py.
-    started = time.monotonic()
-    result = await hass.async_add_executor_job(
-        partial(
-            geometry.solve_layout,
-            ordered,
-            direct,
-            observations,
-            levels,
-            previous=hass.data[DOMAIN]["solve_cache"].get("calibrated"),
-        )
+    payload = solver_process.encode(
+        ordered,
+        direct,
+        observations,
+        levels,
+        previous=hass.data[DOMAIN]["solve_cache"].get("calibrated"),
     )
+    started = time.monotonic()
+    result = await _async_run_solver(hass, payload)
     elapsed = time.monotonic() - started
     result["solve_seconds"] = round(elapsed, 2)
     if elapsed > SOLVE_SLOW_SECONDS:
@@ -483,6 +482,32 @@ async def _async_solve(
     result["tracked_beacons"] = tracked
 
     return result
+
+
+async def _async_run_solver(
+    hass: HomeAssistant, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Solve in a child process, falling back to an executor thread.
+
+    The child is the whole point -- see solver_process for the measurements --
+    but a solve is more useful than a principle, so if the process cannot be
+    started at all the work still happens, just at the old cost.
+    """
+    try:
+        return await solver_process.async_solve(payload, SOLVE_TIMEOUT_SECONDS)
+    except solver_process.SolverProcessError as err:
+        _LOGGER.warning(
+            "Layout solve subprocess failed (%s); falling back to an executor "
+            "thread, which briefly slows the whole instance",
+            err,
+        )
+    except OSError as err:
+        _LOGGER.warning(
+            "Could not start the layout solve subprocess (%s); falling back to "
+            "an executor thread",
+            err,
+        )
+    return await hass.async_add_executor_job(partial(solver_process.solve, payload))
 
 
 def _apply_calibration(hass: HomeAssistant, result: dict[str, Any]) -> None:

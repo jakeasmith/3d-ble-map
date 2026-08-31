@@ -104,4 +104,9 @@ SOLVE_SLOW_SECONDS = 5.0
 # reads as still.
 CALIBRATION_RATE = 0.03
 
+# A solve that has not finished by now is wedged rather than slow, and is killed.
+# The normal figure is 5-7 s; this is far enough above it that only a genuine
+# hang trips it, and a killed child costs one stale map rather than a stuck core.
+SOLVE_TIMEOUT_SECONDS = 120.0
+
 WS_RAW_OBSERVATIONS = f"{DOMAIN}/raw_observations"

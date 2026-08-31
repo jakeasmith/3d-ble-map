@@ -40,6 +40,7 @@ geometry = _load("geometry")
 refine = _load("refine")
 calibration = _load("calibration")
 quality = _load("quality")
+solver_process = _load("solver_process")
 
 # A two-storey house, metres. Mirrors the real deployment: five anchors, three
 # of which advertise and so can be heard directly by the others.
@@ -810,6 +811,71 @@ def test_edge_cases() -> bool:
     return ok
 
 
+def test_solver_subprocess() -> bool:
+    """The child process must return exactly what solving in-process returns.
+
+    The solve was moved off the interpreter's lock, not changed. If the two ever
+    disagree the map silently depends on which path ran, so this pins them
+    together -- and it is also the only check that the child can import the
+    solver at all without dragging Home Assistant in with it.
+    """
+    import asyncio
+    import json
+
+    random.seed(20260831)
+    direct, observations, _beacons = simulate()
+    anchors = list(TRUTH)
+
+    here = geometry.solve_layout(anchors, direct, observations, LEVELS)
+    payload = solver_process.encode(anchors, direct, observations, LEVELS)
+
+    ok = check(
+        "the payload survives a pipe",
+        json.loads(json.dumps(payload))["anchors"] == list(anchors),
+        f"{len(json.dumps(payload))} bytes of JSON",
+    )
+
+    try:
+        there = asyncio.run(solver_process.async_solve(payload, 300.0))
+    except solver_process.SolverProcessError as err:
+        return ok & check("the child process runs", False, str(err))
+
+    moved = max(
+        math.dist(
+            [here["positions"][a][k] for k in "xyz"],
+            [there["positions"][a][k] for k in "xyz"],
+        )
+        for a in anchors
+    )
+    ok &= check(
+        "the child returns the same layout",
+        moved < 1e-9,
+        f"largest radio disagreement {moved:.2e} m over {len(anchors)} radios",
+    )
+    ok &= check(
+        "and the same fit",
+        (here["residual_db"], here["beacons_used"])
+        == (there["residual_db"], there["beacons_used"]),
+        f"{there['residual_db']} dB over {there['beacons_used']} beacons",
+    )
+    ok &= check(
+        "a solve that overruns its deadline is killed, not left running",
+        _times_out(payload),
+        "raised SolverProcessError instead of hanging",
+    )
+    return ok
+
+
+def _times_out(payload: dict) -> bool:
+    import asyncio
+
+    try:
+        asyncio.run(solver_process.async_solve(payload, 0.001))
+    except solver_process.SolverProcessError:
+        return True
+    return False
+
+
 def main() -> int:
     passed = True
     for test in (
@@ -823,6 +889,7 @@ def main() -> int:
         test_solve_is_bounded,
         test_weak_readings,
         test_calibration,
+        test_solver_subprocess,
         test_edge_cases,
     ):
         print(f"\n{test.__name__}")
